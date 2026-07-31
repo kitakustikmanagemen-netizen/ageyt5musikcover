@@ -870,11 +870,20 @@ export default function App() {
 
   // API Key Storage
   const [apiKeys, setApiKeys] = useState({
-    stemsplit: [{ id: 1, key: '', label: 'Key Utama', remainingCredit: null, lastChecked: null }],
-    kitsai: [{ id: 1, key: '', label: 'Key Utama', remainingCredit: null, lastChecked: null }],
-    elevenlabs: [{ id: 1, key: '', label: 'Key Utama', remainingCredit: null, lastChecked: null }],
-    lalal: [{ id: 1, key: '', label: 'Key Utama', remainingCredit: null, lastChecked: null }],
-    kieai: [{ id: 1, key: '', label: 'Key Utama', remainingCredit: null, lastChecked: null }]
+    stemsplit: [],
+    kitsai: [],
+    elevenlabs: [],
+    lalal: [],
+    kieai: []
+  });
+
+  // Temporary input state for adding new keys
+  const [tempKeyInputs, setTempKeyInputs] = useState({
+    stemsplit: '',
+    kitsai: '',
+    elevenlabs: '',
+    lalal: '',
+    kieai: ''
   });
 
   const fileInputRef = useRef(null);
@@ -889,6 +898,48 @@ export default function App() {
 
   const removeToast = (id) => {
     setToasts(prev => prev.filter(t => t.id !== id));
+  };
+
+  const handleSaveKey = (service) => {
+    const rawVal = tempKeyInputs[service] ? tempKeyInputs[service].trim() : '';
+    if (!rawVal) {
+      addToast('warning', 'Masukkan API Key terlebih dahulu');
+      return;
+    }
+
+    const currentList = apiKeys[service] || [];
+    if (currentList.some(item => item.key === rawVal)) {
+      addToast('warning', 'API Key ini sudah ada di daftar tersimpan');
+      return;
+    }
+
+    const newKeyObj = {
+      id: Date.now(),
+      key: rawVal,
+      label: `Key ${currentList.length + 1}`,
+      remainingCredit: null,
+      statusText: null,
+      lastChecked: null
+    };
+
+    setApiKeys(prev => ({
+      ...prev,
+      [service]: [...(prev[service] || []), newKeyObj]
+    }));
+
+    setTempKeyInputs(prev => ({ ...prev, [service]: '' }));
+    addToast('info', 'Key berhasil disimpan');
+
+    // Automatically check credit for newly saved key
+    checkCredit(service, rawVal);
+  };
+
+  const handleDeleteKey = (service, keyId) => {
+    setApiKeys(prev => ({
+      ...prev,
+      [service]: (prev[service] || []).filter(k => k.id !== keyId)
+    }));
+    addToast('info', 'Key berhasil dihapus');
   };
 
   useEffect(() => {
@@ -1105,11 +1156,27 @@ export default function App() {
     let kitsKey = getNextAvailableKey('kitsai');
     let success = false;
 
+    // Helper untuk mengambil Blob file vokal (menggunakan proxy relay-fetch jika URL eksternal StemSplit)
+    const fetchVocalBlob = async () => {
+      if (vocalStemBlob) return vocalStemBlob;
+      if (!vocalStemUrl) throw new Error('File vokal tidak ditemukan');
+      if (vocalStemUrl.startsWith('blob:')) {
+        return await fetch(vocalStemUrl).then(r => r.blob());
+      }
+      console.log('[DEBUG-ElevenLabs] Mengambil file vokal via proxy...');
+      const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(vocalStemUrl)}`;
+      const response = await fetch(proxiedUrl);
+      if (!response.ok) {
+        throw new Error(`Gagal mengambil audio vokal via proxy (HTTP ${response.status})`);
+      }
+      return await response.blob();
+    };
+
     // Prioritas 1: ElevenLabs (Utama)
     if (elevenKey) {
       try {
         console.log('[DEBUG-VoiceConv] Mencoba ElevenLabs via Proxy...');
-        const vocalBlob = vocalStemBlob || await fetch(vocalStemUrl).then(r => r.blob());
+        const vocalBlob = await fetchVocalBlob();
         const res = await convertVoiceElevenLabs(vocalBlob, selectedVoiceModel, elevenKey, (p, text) => {
           setVoiceProgress(p);
           setVoiceStatusText(text);
@@ -1129,7 +1196,7 @@ export default function App() {
     if (!success && kitsKey) {
       try {
         console.log('[DEBUG-VoiceConv] Mencoba Kits.AI...');
-        const vocalBlob = vocalStemBlob || await fetch(vocalStemUrl).then(r => r.blob());
+        const vocalBlob = await fetchVocalBlob();
         const res = await convertVoiceApi(vocalBlob, selectedVoiceModel, kitsKey, (p, text) => {
           setVoiceProgress(p);
           setVoiceStatusText(text);
@@ -1147,7 +1214,7 @@ export default function App() {
     // Prioritas 3: Efek Pitch Shift Lokal (Jaring Pengaman Terakhir)
     if (!success) {
       try {
-        const vocalBlob = vocalStemBlob || await fetch(vocalStemUrl).then(r => r.blob());
+        const vocalBlob = await fetchVocalBlob();
         const res = await convertVoiceLocal(vocalBlob, 'male', (p, text) => {
           setVoiceProgress(p);
           setVoiceStatusText(text);
@@ -1173,6 +1240,22 @@ export default function App() {
 
     let success = false;
 
+    // Helper untuk mengambil Blob file instrumen (menggunakan proxy relay-fetch jika URL eksternal StemSplit)
+    const fetchInstBlob = async () => {
+      if (instStemBlob) return instStemBlob;
+      if (!instStemUrl) throw new Error('File instrumen tidak ditemukan');
+      if (instStemUrl.startsWith('blob:')) {
+        return await fetch(instStemUrl).then(r => r.blob());
+      }
+      console.log('[DEBUG-Style] Mengambil file instrumen via proxy...');
+      const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(instStemUrl)}`;
+      const response = await fetch(proxiedUrl);
+      if (!response.ok) {
+        throw new Error(`Gagal mengambil audio instrumen via proxy (HTTP ${response.status})`);
+      }
+      return await response.blob();
+    };
+
     if (styleMode === 'kie') {
       let kieKey = getNextAvailableKey('kieai');
       if (kieKey) {
@@ -1193,7 +1276,7 @@ export default function App() {
 
     if (!success) {
       try {
-        const instBlob = instStemBlob || await fetch(instStemUrl).then(r => r.blob());
+        const instBlob = await fetchInstBlob();
         const res = await applyLocalStyleEffect(instBlob, selectedGenre, moodValue, pitchValue, tempoValue, (p, text) => {
           setStyleProgress(p);
           setStyleStatusText(text);
@@ -1297,9 +1380,10 @@ export default function App() {
         </div>
       </header>
 
-      {}
+      {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
         
+        {}
         {/* Panel 1: Upload Lagu */}
         <section className="p-6 sm:p-8 rounded-2xl bg-slate-900/40 border border-slate-800/80 backdrop-blur-xl shadow-2xl relative overflow-hidden group hover:border-slate-700/80 transition-all">
           <div className="flex items-center gap-3 mb-6">
@@ -1377,6 +1461,7 @@ export default function App() {
         </section>
 
         {}
+        {/* Panel 2: Suara & Gaya */}
         <section className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           
           {/* Sub-Panel A: Ubah Vokal */}
@@ -1516,6 +1601,7 @@ export default function App() {
         </section>
 
         {}
+        {/* Panel 3: Proses & Hasil */}
         <section className="p-6 sm:p-8 rounded-2xl bg-slate-900/40 border border-slate-800/80 backdrop-blur-xl shadow-2xl relative overflow-hidden">
           <div className="flex items-center gap-3 mb-6">
             <div className="p-2 rounded-xl bg-cyan-500/10 border border-cyan-500/20 text-cyan-400">
@@ -1537,9 +1623,9 @@ export default function App() {
             <span className={finalCoverUrl ? 'text-emerald-400' : ''}>5. Mix Cover {finalCoverUrl && '✓'}</span>
           </div>
 
-          {/* Action Button: Separasi */}
+          {/* Separasi Action & Progress */}
           {!vocalStemUrl && (
-            <div className="mb-6">
+            <div className="mb-6 space-y-4">
               <button 
                 onClick={handleStartVocalSeparation}
                 disabled={!uploadedFile || isSeparating}
@@ -1552,68 +1638,98 @@ export default function App() {
                 <span>{isSeparating ? separationStatusText : 'Pisahkan Vokal & Instrumen'}</span>
               </button>
 
-              {/* Animated Equalizer Visualizer during processing */}
               {isSeparating && (
-                <div className="mt-4 flex items-center justify-center gap-1.5 h-8">
-                  <div className="w-1.5 bg-cyan-400 rounded-full animate-bounce h-full" style={{ animationDelay: '0ms' }} />
-                  <div className="w-1.5 bg-pink-400 rounded-full animate-bounce h-full" style={{ animationDelay: '150ms' }} />
-                  <div className="w-1.5 bg-purple-400 rounded-full animate-bounce h-full" style={{ animationDelay: '300ms' }} />
-                  <div className="w-1.5 bg-cyan-400 rounded-full animate-bounce h-full" style={{ animationDelay: '450ms' }} />
+                <div className="space-y-2 p-4 rounded-xl bg-slate-950/80 border border-cyan-500/30 animate-pulse">
+                  <div className="flex items-center justify-between text-xs font-semibold text-cyan-400">
+                    <span>{separationStatusText}</span>
+                    <span>{separationProgress}%</span>
+                  </div>
+                  <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                    <div className="bg-gradient-to-r from-cyan-400 to-pink-500 h-full transition-all duration-300" style={{ width: `${separationProgress}%` }}></div>
+                  </div>
                 </div>
               )}
             </div>
           )}
 
+          {/* Local Fallback Warning Badge */}
           {localFallbackInfo && (
-            <div className="mb-6 p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-amber-200 text-xs flex items-center gap-2">
+            <div className="mb-6 p-4 rounded-xl bg-amber-950/40 border border-amber-500/30 text-amber-200 text-xs flex items-center gap-2">
               <Info className="w-4 h-4 text-amber-400 flex-shrink-0" />
               <span>{localFallbackInfo}</span>
             </div>
           )}
 
-          {/* Results Display */}
-          {vocalStemUrl && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-              <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
-                <p className="text-xs font-bold text-cyan-400">Vokal Asli Saja</p>
+          {/* Stem Audio Results Display */}
+          {vocalStemUrl && instStemUrl && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8 animate-fade-in">
+              <div className="p-4 rounded-xl bg-slate-950/80 border border-cyan-500/30 space-y-2">
+                <p className="text-xs font-bold text-cyan-400 flex items-center gap-2">
+                  <AudioLines className="w-4 h-4" /> Stem Vokal Saja
+                </p>
                 <audio controls src={vocalStemUrl} className="w-full h-8" />
               </div>
 
-              <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
-                <p className="text-xs font-bold text-cyan-400">Instrumen Asli Saja</p>
+              <div className="p-4 rounded-xl bg-slate-950/80 border border-purple-500/30 space-y-2">
+                <p className="text-xs font-bold text-purple-400 flex items-center gap-2">
+                  <Music className="w-4 h-4" /> Stem Instrumental Saja
+                </p>
                 <audio controls src={instStemUrl} className="w-full h-8" />
               </div>
             </div>
           )}
 
-          {/* Final Mix Action */}
-          <div className="pt-6 border-t border-slate-800/80">
+          {/* Final Mixing Section */}
+          <div className="pt-6 border-t border-slate-800/80 space-y-4">
             <button 
               onClick={handleStartFinalMixing}
-              disabled={isMixing}
-              className={`w-full py-4 rounded-xl font-bold text-base flex items-center justify-center gap-3 transition-all ${
-                isMixing ? 'bg-slate-800 text-slate-500' : 'bg-gradient-to-r from-emerald-400 to-cyan-500 text-slate-950 hover:shadow-[0_0_25px_rgba(52,211,153,0.5)]'
+              disabled={(!convertedVocalUrl && !vocalStemUrl) || (!newInstUrl && !instStemUrl) || isMixing}
+              className={`w-full py-4 rounded-xl font-bold text-sm sm:text-base flex items-center justify-center gap-3 transition-all ${
+                (!convertedVocalUrl && !vocalStemUrl) || (!newInstUrl && !instStemUrl) ? 'bg-slate-800 text-slate-500 cursor-not-allowed' :
+                'bg-gradient-to-r from-emerald-500 to-cyan-500 text-slate-950 hover:shadow-[0_0_25px_rgba(16,185,129,0.5)]'
               }`}
             >
-              {isMixing ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Music className="w-5 h-5" />}
+              {isMixing ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
               <span>{isMixing ? mixStatusText : 'Gabungkan & Buat Cover Final'}</span>
             </button>
 
+            {isMixing && (
+              <div className="space-y-2 p-4 rounded-xl bg-slate-950/80 border border-emerald-500/30 animate-pulse">
+                <div className="flex items-center justify-between text-xs font-semibold text-emerald-400">
+                  <span>{mixStatusText}</span>
+                  <span>{mixProgress}%</span>
+                </div>
+                <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                  <div className="bg-gradient-to-r from-emerald-400 to-cyan-400 h-full transition-all duration-300" style={{ width: `${mixProgress}%` }}></div>
+                </div>
+              </div>
+            )}
+
+            {/* Final Cover Display & Download */}
             {finalCoverUrl && (
-              <div className="mt-6 p-6 rounded-2xl bg-gradient-to-r from-slate-950 to-emerald-950/40 border border-emerald-500/40 space-y-4">
-                <div className="flex items-center justify-between">
-                  <p className="font-extrabold text-emerald-400 text-base flex items-center gap-2">
-                    <Sparkles className="w-5 h-5" /> Hasil Cover Lagu Anda
-                  </p>
+              <div className="p-6 rounded-2xl bg-gradient-to-r from-cyan-950/40 via-purple-950/40 to-slate-950 border border-emerald-500/40 space-y-4 animate-fade-in shadow-2xl">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2.5 rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                      <Radio className="w-6 h-6 animate-pulse" />
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-slate-100 text-base">Hasil Cover Lagu Anda</h3>
+                      <p className="text-xs text-slate-400">Siap didengarkan dan diunduh (WAV PCM 16-bit)</p>
+                    </div>
+                  </div>
+
                   <a 
                     href={finalCoverUrl} 
-                    download={`AGE-YT5-Cover-${uploadedFile ? uploadedFile.name : 'song'}.wav`}
-                    className="px-4 py-2 rounded-xl bg-emerald-500 text-slate-950 font-bold text-xs sm:text-sm flex items-center gap-2 hover:bg-emerald-400 transition-all"
+                    download={`AGE-YT5-Cover-${uploadedFile?.name ? uploadedFile.name.replace(/\.[^/.]+$/, "") : "lagu"}.wav`}
+                    className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-400 to-teal-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center gap-2 hover:shadow-[0_0_20px_rgba(52,211,153,0.4)] transition-all"
                   >
-                    <Download className="w-4 h-4" /> Download (.wav)
+                    <Download className="w-4 h-4" />
+                    <span>Download Cover (.wav)</span>
                   </a>
                 </div>
-                <audio controls src={finalCoverUrl} className="w-full h-10" />
+
+                <audio controls src={finalCoverUrl} className="w-full h-10 rounded-xl" />
               </div>
             )}
           </div>
@@ -1622,6 +1738,7 @@ export default function App() {
       </main>
 
       {}
+      {/* API Key Modal */}
       {showApiModal && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full p-6 space-y-6 max-h-[90vh] overflow-y-auto">
@@ -1635,52 +1752,124 @@ export default function App() {
             </div>
 
             <div className="space-y-6">
-              {Object.keys(apiKeys).map(service => (
-                <div key={service} className="space-y-3 p-4 rounded-xl bg-slate-950 border border-slate-800">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-sm uppercase text-cyan-400">{service}</span>
-                    <button 
-                      onClick={() => {
-                        const newKey = { id: Date.now(), key: '', label: 'Key Cadangan', remainingCredit: null };
-                        setApiKeys(prev => ({ ...prev, [service]: [...prev[service], newKey] }));
-                      }}
-                      className="text-xs text-pink-400 hover:underline"
-                    >
-                      + Tambah Key
-                    </button>
-                  </div>
+              {Object.keys(apiKeys).map(service => {
+                const serviceKeys = apiKeys[service] || [];
+                const activeCandidate = getNextAvailableKey(service);
 
-                  {apiKeys[service].map(k => (
-                    <div key={k.id} className="flex items-center gap-2">
+                return (
+                  <div key={service} className="space-y-3 p-4 rounded-xl bg-slate-950 border border-slate-800">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-sm uppercase text-cyan-400">{service}</span>
+                      <span className="text-[10px] text-slate-400">
+                        {serviceKeys.length} Key Tersimpan
+                      </span>
+                    </div>
+
+                    {/* Input Tambah Key Baru */}
+                    <div className="flex items-center gap-2">
                       <input 
                         type="password" 
-                        placeholder="Masukkan API Key"
-                        value={k.key}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setApiKeys(prev => ({
-                            ...prev,
-                            [service]: prev[service].map(item => item.id === k.id ? { ...item, key: val } : item)
-                          }));
+                        placeholder={`Masukkan API Key ${service.toUpperCase()} baru...`}
+                        value={tempKeyInputs[service] || ''}
+                        onChange={(e) => setTempKeyInputs(prev => ({ ...prev, [service]: e.target.value }))}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleSaveKey(service);
                         }}
-                        className="flex-1 p-2 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200"
+                        className="flex-1 p-2 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 focus:outline-none focus:border-cyan-500"
                       />
                       <button 
-                        onClick={() => checkCredit(service, k.key)}
-                        className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs"
+                        onClick={() => handleSaveKey(service)}
+                        className="px-3 py-2 rounded-lg bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-400 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-1 transition-all shadow-md shadow-cyan-500/20"
+                        title="Simpan Key ini ke daftar"
+                      >
+                        <span>💾 Simpan</span>
+                      </button>
+                      <button 
+                        onClick={() => {
+                          const val = tempKeyInputs[service];
+                          if (val) {
+                            checkCredit(service, val);
+                          } else if (activeCandidate) {
+                            checkCredit(service, activeCandidate);
+                          } else {
+                            addToast('warning', 'Masukkan Key untuk dicek');
+                          }
+                        }}
+                        title="Cek Kredit Key"
+                        className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition-all"
                       >
                         <RefreshCw className="w-3.5 h-3.5" />
                       </button>
                     </div>
-                  ))}
-                  {service === 'stemsplit' && (
-                    <p className="text-[10px] text-slate-500">Akun gratis StemSplit.io mendapat 5 menit kredit pemrosesan gratis tanpa kartu kredit.</p>
-                  )}
-                  {service === 'elevenlabs' && (
-                    <p className="text-[10px] text-slate-500">Akun gratis ElevenLabs mendapat 10.000 kredit/bulan tanpa kartu kredit — cukup untuk beberapa kali konversi vokal.</p>
-                  )}
-                </div>
-              ))}
+
+                    {/* Daftar Key Tersimpan */}
+                    {serviceKeys.length > 0 && (
+                      <div className="space-y-2 mt-3 pt-3 border-t border-slate-800/80">
+                        <p className="text-[11px] font-semibold text-slate-400 mb-1">Daftar Key Tersimpan:</p>
+                        {serviceKeys.map((k) => {
+                          const isCandidate = activeCandidate && activeCandidate === k.key;
+                          const isFailed = k.remainingCredit === 'failed';
+
+                          const maskedKey = k.key && k.key.length > 10 
+                            ? `${k.key.slice(0, 4)}...${k.key.slice(-4)}`
+                            : '••••••••';
+
+                          return (
+                            <div key={k.id} className="flex flex-wrap items-center justify-between p-2.5 rounded-lg bg-slate-900/80 border border-slate-800/80 gap-2">
+                              <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                                <span className="text-xs font-mono font-medium text-slate-200">{maskedKey}</span>
+                                {isFailed ? (
+                                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30 flex items-center gap-1">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
+                                    🔴 Gagal
+                                  </span>
+                                ) : isCandidate ? (
+                                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                                    🟢 AKTIF
+                                  </span>
+                                ) : (
+                                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-400 border border-slate-700 flex items-center gap-1">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
+                                    ⚪ Standby
+                                  </span>
+                                )}
+                                {k.statusText && (
+                                  <span className="text-[10px] text-slate-400 truncate max-w-[150px]">({k.statusText})</span>
+                                )}
+                              </div>
+
+                              <div className="flex items-center gap-1">
+                                <button 
+                                  onClick={() => checkCredit(service, k.key)}
+                                  title="Refresh Kredit Key Ini"
+                                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition-all"
+                                >
+                                  <RefreshCw className="w-3.5 h-3.5" />
+                                </button>
+                                <button 
+                                  onClick={() => handleDeleteKey(service, k.id)}
+                                  title="Hapus Key"
+                                  className="p-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 text-xs transition-all"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {service === 'stemsplit' && (
+                      <p className="text-[10px] text-slate-500">Akun gratis StemSplit.io mendapat 5 menit kredit pemrosesan gratis tanpa kartu kredit.</p>
+                    )}
+                    {service === 'elevenlabs' && (
+                      <p className="text-[10px] text-slate-500">Akun gratis ElevenLabs mendapat 10.000 kredit/bulan tanpa kartu kredit — cukup untuk beberapa kali konversi vokal.</p>
+                    )}
+                  </div>
+                );
+              })}
             </div>
 
             <p className="text-xs text-slate-500 italic">
@@ -1691,6 +1880,7 @@ export default function App() {
       )}
 
       {}
+      {/* Help Modal */}
       {showHelpModal && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full p-6 space-y-6 max-h-[90vh] overflow-y-auto">
@@ -1706,13 +1896,21 @@ export default function App() {
             <div className="space-y-4 text-xs text-slate-300">
               <h4 className="font-bold text-cyan-400 text-sm">Cara Mendapatkan API Key Gratis</h4>
               <ul className="space-y-2 list-disc pl-4">
-                <li><b>StemSplit.io</b>: Daftar gratis dan klaim 5 menit kredit pemisahan vokal.</li>
-                <li><b>Kits.AI</b>: Buka dashboard Kits.AI -&gt; API Key -&gt; Buat token gratis.</li>
-                <li><b>Kie.ai</b>: Dapatkan kredit gratis saat pendaftaran baru untuk regenerasi musik.</li>
+                <li><b>StemSplit.io</b> (<a href="https://stemsplit.io" target="_blank" rel="noreferrer" className="text-cyan-400 underline">stemsplit.io</a>): Daftar gratis & klaim 5 menit kredit pemisahan vokal.</li>
+                <li><b>ElevenLabs</b> (<a href="https://elevenlabs.io" target="_blank" rel="noreferrer" className="text-cyan-400 underline">elevenlabs.io</a>): Dapatkan 10.000 kredit/bulan gratis di halaman Profile/Settings.</li>
+                <li><b>Kits.AI</b> (<a href="https://kits.ai" target="_blank" rel="noreferrer" className="text-cyan-400 underline">kits.ai</a>): Buka dashboard -&gt; API -&gt; Buat token gratis.</li>
+                <li><b>LALAL.AI</b> (<a href="https://lalal.ai" target="_blank" rel="noreferrer" className="text-cyan-400 underline">lalal.ai</a>): Tier Starter gratis tanpa kartu kredit.</li>
+                <li><b>Kie.ai</b> (<a href="https://kie.ai" target="_blank" rel="noreferrer" className="text-cyan-400 underline">kie.ai</a>): Dapatkan kredit pendaftaran baru untuk regenerasi musik.</li>
               </ul>
 
               <h4 className="font-bold text-pink-400 text-sm mt-4">Alur Kerja Tools</h4>
               <p>1. Upload lagu -&gt; 2. Pisahkan vokal -&gt; 3. Ubah vokal -&gt; 4. Ubah gaya musik -&gt; 5. Gabungkan dan download!</p>
+
+              <h4 className="font-bold text-purple-400 text-sm mt-4">Pertanyaan Umum (FAQ)</h4>
+              <ul className="space-y-2 list-disc pl-4">
+                <li><b>Kenapa hasilnya kadang pakai DSP Lokal?</b> Server API eksternal kadang tidak terjangkau dari sandbox, tools otomatis memakai mode cadangan agar tetap bisa dipakai.</li>
+                <li><b>Apakah aman memasukkan API key?</b> Key hanya disimpan sementara di sesi browser, tidak dikirim ke server manapun selain penyedia API terkait.</li>
+              </ul>
             </div>
           </div>
         </div>
