@@ -207,10 +207,10 @@ async function applyLocalStyleEffect(audioBlobOrUrl, genre, moodValue, tempoValu
   src.playbackRate.value = rate;
 
   const filter = offlineCtx.createBiquadFilter();
-  if (genre === 'Lofi') {
+  if (genre === 'Lo-Fi' || genre === 'Lofi') {
     filter.type = 'lowpass';
     filter.frequency.value = 1800;
-  } else if (genre === 'EDM') {
+  } else if (genre === 'EDM' || genre === 'Electronic/EDM') {
     filter.type = 'peaking';
     filter.frequency.value = 100;
     filter.gain.value = 6;
@@ -439,11 +439,15 @@ async function convertVoiceElevenLabs(vocalStemBlobOrUrl, voiceId, apiKey, onPro
 async function regenerateInstrumentalApi(prompt, styleString, negativeTags, vocalGender, apiKey, onProgress) {
   onProgress(15, 'Menghubungi Kie.ai API (Model V4)...');
 
+  const promptText = prompt && prompt.trim() !== '' 
+    ? prompt 
+    : `Custom instrumental cover track`;
+
   const payload = {
     customMode: true,
-    prompt: prompt || 'Cover instrumental audio',
+    prompt: promptText,
     style: styleString || 'Acoustic, Calm',
-    negativeTags: negativeTags ? negativeTags.join(', ') : '',
+    negativeTags: Array.isArray(negativeTags) ? negativeTags.join(', ') : (negativeTags || ''),
     title: 'Custom Style Cover'
   };
 
@@ -536,6 +540,7 @@ export default function App() {
   });
 
   // Process & Separation States
+  const [localFallbackInfo, setLocalFallbackInfo] = useState(null);
   const [vocalStemUrl, setVocalStemUrl] = useState(null);
   const [vocalStemBlob, setVocalStemBlob] = useState(null);
   const [instStemUrl, setInstStemUrl] = useState(null);
@@ -556,7 +561,7 @@ export default function App() {
 
   // Style & Genre Options
   const [genreMode, setGenreMode] = useState('fast');
-  const [selectedGenre, setSelectedGenre] = useState('Lofi');
+  const [selectedGenre, setSelectedGenre] = useState('Lo-Fi');
   const [selectedMood, setSelectedMood] = useState('Calm');
   const [selectedTempo, setSelectedTempo] = useState('medium');
   const [vocalGender, setVocalGender] = useState('none');
@@ -575,179 +580,200 @@ export default function App() {
   const [mixStatusText, setMixStatusText] = useState('');
   const [finalCoverUrl, setFinalCoverUrl] = useState(null);
 
-  const [localFallbackInfo, setLocalFallbackInfo] = useState(null);
-
   useEffect(() => {
     setLoaded(true);
   }, []);
 
-  const addToast = (type, text) => {
+  const addToast = (text, type = 'info') => {
     const id = Date.now();
-    setToasts(prev => [...prev, { id, type, text }]);
+    setToasts(prev => [...prev, { id, text, type }]);
     setTimeout(() => {
-      setToasts(prev => prev.filter(t => t.id !== id));
+      removeToast(id);
     }, 6000);
   };
 
-  const removeToast = id => {
+  const removeToast = (id) => {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
-  const getNextAvailableKey = service => {
-    const list = apiKeys[service] || [];
-    return list.find(k => k.status !== 'failed');
+  const handleFileSelect = (file) => {
+    if (!file) return;
+    setUploadError(null);
+
+    const validTypes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-wav'];
+    const ext = file.name.split('.').pop().toLowerCase();
+
+    if (!validTypes.includes(file.type) && ext !== 'mp3' && ext !== 'wav') {
+      setUploadError('Format file tidak didukung! Harap upload file .mp3 atau .wav.');
+      addToast('Format file tidak didukung!', 'error');
+      return;
+    }
+
+    if (file.size > 50 * 1024 * 1024) {
+      setUploadError('Ukuran file terlalu besar! Maksimal 50MB.');
+      addToast('File melebihi batas 50MB!', 'error');
+      return;
+    }
+
+    setUploadedFile(file);
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    setAudioUrl(URL.createObjectURL(file));
+
+    // Reset downstream states
+    setVocalStemUrl(null);
+    setInstStemUrl(null);
+    setConvertedVocalUrl(null);
+    setNewInstUrl(null);
+    setFinalCoverUrl(null);
+    setLocalFallbackInfo(null);
+    addToast(`File "${file.name}" berhasil diunggah`, 'info');
   };
 
-  const markKeyAsFailed = (service, keyVal) => {
-    setApiKeys(prev => ({
-      ...prev,
-      [service]: (prev[service] || []).map(k => k.key === keyVal ? { ...k, status: 'failed' } : k)
-    }));
+  const handleLoadSampleSong = () => {
+    const sampleAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const duration = 4.0;
+    const sampleRate = sampleAudioCtx.sampleRate;
+    const buffer = sampleAudioCtx.createBuffer(2, duration * sampleRate, sampleRate);
+
+    for (let channel = 0; channel < 2; channel++) {
+      const data = buffer.getChannelData(channel);
+      for (let i = 0; i < buffer.length; i++) {
+        const t = i / sampleRate;
+        const melody = Math.sin(2 * Math.PI * 440 * t) * 0.3 * Math.exp(-t * 0.5);
+        const chord = Math.sin(2 * Math.PI * 261.63 * t) * 0.2;
+        data[i] = melody + chord;
+      }
+    }
+
+    const wavBlob = audioBufferToWav(buffer);
+    const sampleFile = new File([wavBlob], 'Sample_Testing_Song.wav', { type: 'audio/wav' });
+    handleFileSelect(sampleFile);
   };
 
   const checkCredit = async (service, apiKey) => {
-    try {
-      if (service === 'elevenlabs') {
-        const res = await fetch('https://api.elevenlabs.io/v1/user/subscription', {
+    if (!apiKey) return;
+    if (service === 'elevenlabs') {
+      try {
+        const res = await fetch('https://stemsplit-proxy.kitakustik-managemen.workers.dev/elevenlabs/v1/user/subscription', {
           headers: { 'xi-api-key': apiKey }
         });
         if (res.ok) {
           const data = await res.json();
-          const rem = data.character_limit - data.character_count;
-          return { remainingCredit: rem, labelInfo: `${rem.toLocaleString()} karakter` };
+          const rem = (data.character_limit || 10000) - (data.character_count || 0);
+          setApiKeys(prev => ({
+            ...prev,
+            elevenlabs: prev.elevenlabs.map(k => k.key === apiKey ? { ...k, remainingCredit: rem, labelInfo: `${rem} char` } : k)
+          }));
         }
-      } else if (service === 'kieai') {
+      } catch (e) {
+        console.warn('ElevenLabs check credit warning:', e);
+      }
+    } else if (service === 'kieai') {
+      try {
         const res = await fetch('https://api.kie.ai/api/v1/chat/credit', {
           headers: { 'Authorization': `Bearer ${apiKey}` }
         });
         if (res.ok) {
-          const data = await res.json();
-          if (data.code === 200) {
-            return { remainingCredit: data.data, labelInfo: `${data.data} kredit` };
-          }
+          const resData = await res.json();
+          const val = typeof resData.data === 'number' ? resData.data : 0;
+          setApiKeys(prev => ({
+            ...prev,
+            kieai: prev.kieai.map(k => k.key === apiKey ? { ...k, remainingCredit: val, labelInfo: `${val} credit` } : k)
+          }));
         }
+      } catch (e) {
+        console.warn('Kie.ai check credit warning:', e);
       }
-    } catch (e) {
-      console.warn(`[Credit Check Error] ${service}:`, e);
     }
-    return { remainingCredit: null, labelInfo: 'Tersimpan' };
   };
 
-  const handleSaveKey = async service => {
+  const handleSaveKey = (service) => {
     const val = tempKeyInputs[service]?.trim();
     if (!val) return;
 
-    const creditInfo = await checkCredit(service, val);
     const newEntry = {
       key: val,
-      label: `Key ${apiKeys[service].length + 1}`,
-      remainingCredit: creditInfo.remainingCredit,
-      labelInfo: creditInfo.labelInfo,
-      status: 'active'
+      status: 'active',
+      remainingCredit: 100,
+      labelInfo: 'Tersimpan'
     };
 
     setApiKeys(prev => ({
       ...prev,
       [service]: [...(prev[service] || []), newEntry]
     }));
+
     setTempKeyInputs(prev => ({ ...prev, [service]: '' }));
-    addToast('info', `Key ${service.toUpperCase()} berhasil disimpan!`);
+    checkCredit(service, val);
+    addToast(`API Key ${service.toUpperCase()} berhasil disimpan!`, 'info');
   };
 
   const handleDeleteKey = (service, index) => {
     setApiKeys(prev => ({
       ...prev,
-      [service]: prev[service].filter((_, i) => i !== index)
+      [service]: prev[service].filter((_, idx) => idx !== index)
     }));
-    addToast('info', 'Key dihapus.');
+    addToast('API Key dihapus', 'warn');
   };
 
-  const handleFileSelect = file => {
-    setUploadError(null);
-    if (!file) return;
-
-    const validTypes = ['audio/mp3', 'audio/mpeg', 'audio/wav', 'audio/x-wav'];
-    const ext = file.name.split('.').pop().toLowerCase();
-
-    if (!validTypes.includes(file.type) && !['mp3', 'wav'].includes(ext)) {
-      setUploadError('Hanya file format .MP3 dan .WAV yang diperbolehkan!');
-      addToast('error', 'Format file ditolak! Gunakan MP3 atau WAV.');
-      return;
-    }
-
-    if (file.size > 50 * 1024 * 1024) {
-      setUploadError('Ukuran file terlalu besar! Maksimal 50MB.');
-      addToast('error', 'File terlalu besar (>50MB).');
-      return;
-    }
-
-    setUploadedFile(file);
-    const url = URL.createObjectURL(file);
-    setAudioUrl(url);
-    addToast('info', 'Lagu berhasil diunggah!');
+  const getNextAvailableKey = (service) => {
+    const list = apiKeys[service] || [];
+    const valid = list.find(k => k.status !== 'failed');
+    return valid ? valid.key : null;
   };
 
-  const handleLoadSampleSong = () => {
-    const sampleRate = 44100;
-    const duration = 4;
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const buffer = audioCtx.createBuffer(1, sampleRate * duration, sampleRate);
-    const data = buffer.getChannelData(0);
-
-    for (let i = 0; i < buffer.length; i++) {
-      data[i] = Math.sin(2 * Math.PI * 440 * (i / sampleRate)) * Math.exp(-3 * (i / (sampleRate * duration)));
-    }
-
-    const wavBlob = audioBufferToWav(buffer);
-    const sampleFile = new File([wavBlob], 'Sample-Lagu-4s.wav', { type: 'audio/wav' });
-    handleFileSelect(sampleFile);
+  const markKeyAsFailed = (service, key) => {
+    setApiKeys(prev => ({
+      ...prev,
+      [service]: prev[service].map(k => k.key === key ? { ...k, status: 'failed', labelInfo: '🔴 Failed' } : k)
+    }));
   };
 
   const handleStartVocalSeparation = async () => {
     if (!uploadedFile) return;
     setIsSeparating(true);
     setSepProgress(10);
-    setSepStatusText('Memulai pemisahan audio...');
+    setSepStatusText('Memulai pemisahan trek...');
     setLocalFallbackInfo(null);
 
     const stemSplitKey = getNextAvailableKey('stemsplit');
+
     if (stemSplitKey) {
       try {
-        const res = await separateVocalsStemSplit(uploadedFile, stemSplitKey.key, (p, text) => {
-          setSepProgress(p);
-          setSepStatusText(text);
+        const res = await separateVocalsStemSplit(uploadedFile, stemSplitKey, (prog, txt) => {
+          setSepProgress(prog);
+          setSepStatusText(txt);
         });
         setVocalStemBlob(res.vocalBlob);
-        setVocalStemUrl(res.vocalUrl);
         setInstStemBlob(res.instBlob);
+        setVocalStemUrl(res.vocalUrl);
         setInstStemUrl(res.instUrl);
+        addToast('Pemisahan vokal & instrumen via StemSplit berhasil!', 'info');
         setIsSeparating(false);
-        addToast('info', 'Pemisahan Vokal & Instrumen Sukses (StemSplit.io)!');
         return;
-      } catch (err) {
-        console.warn('[StemSplit Error]', err);
-        markKeyAsFailed('stemsplit', stemSplitKey.key);
+      } catch (e) {
+        console.warn('StemSplit.io error, mencoba fallback:', e);
+        markKeyAsFailed('stemsplit', stemSplitKey);
       }
     }
 
-    setSepStatusText('Beralih ke Engine DSP Lokal...');
-    setLocalFallbackInfo('ℹ️ Diproses via Engine DSP Lokal — server API eksternal tidak dapat dijangkau.');
+    setLocalFallbackInfo('ℹ️ Diproses via Engine DSP Lokal (kualitas standar) — API eksternal tidak dapat dijangkau dari sandbox preview ini.');
     try {
-      const res = await processLocalAudioSeparation(uploadedFile, (p, text) => {
-        setSepProgress(p);
-        setSepStatusText(text);
+      const localRes = await processLocalAudioSeparation(uploadedFile, (prog, txt) => {
+        setSepProgress(prog);
+        setSepStatusText(txt);
       });
-      setVocalStemBlob(res.vocalBlob);
-      setVocalStemUrl(res.vocalUrl);
-      setInstStemBlob(res.instBlob);
-      setInstStemUrl(res.instUrl);
-      addToast('warn', 'Diproses via Engine DSP Lokal.');
+      setVocalStemBlob(localRes.vocalBlob);
+      setInstStemBlob(localRes.instBlob);
+      setVocalStemUrl(localRes.vocalUrl);
+      setInstStemUrl(localRes.instUrl);
+      addToast('Pemisahan vokal selesai via DSP Lokal', 'warn');
     } catch (err) {
-      console.error('Fatal DSP Error:', err);
-      addToast('error', 'Gagal memproses audio lokal.');
+      console.error('Fatal DSP Local separation error:', err);
+      addToast('Gagal memisahkan vokal & instrumen!', 'error');
+    } finally {
+      setIsSeparating(false);
     }
-
-    setIsSeparating(false);
   };
 
   const handleStartVoiceConversion = async () => {
@@ -756,154 +782,153 @@ export default function App() {
 
     setIsConvertingVoice(true);
     setVoiceProgress(10);
-    setVoiceStatusText('Memulai konversi vokal...');
+    setVoiceStatusText('Memproses karakter vokal...');
 
     if (voiceMode === 'pitch') {
       try {
+        setVoiceProgress(50);
+        setVoiceStatusText('Mengubah pitch vokal di browser...');
         const res = await convertVoiceLocal(inputAudio, selectedPitchPreset);
         setConvertedVocalBlob(res.blob);
         setConvertedVocalUrl(res.url);
-        addToast('info', 'Efek Pitch Vokal Berhasil Diterapkan!');
-      } catch (err) {
-        console.warn('Pitch local error:', err);
-        addToast('error', 'Gagal mengubah pitch vokal.');
+        setVoiceProgress(100);
+        addToast('Konversi pitch vokal selesai!', 'info');
+      } catch (e) {
+        console.warn('Pitch conversion warning:', e);
+        addToast('Gagal mengubah pitch vokal', 'error');
+      } finally {
+        setIsConvertingVoice(false);
       }
-      setIsConvertingVoice(false);
       return;
     }
 
-    // AI Voice Mode
-    const elKey = getNextAvailableKey('elevenlabs');
-    if (elKey && selectedVoiceModel) {
+    const elevenKey = getNextAvailableKey('elevenlabs');
+    if (elevenKey && selectedVoiceModel) {
       try {
-        const res = await convertVoiceElevenLabs(inputAudio, selectedVoiceModel, elKey.key, (p, text) => {
-          setVoiceProgress(p);
-          setVoiceStatusText(text);
+        const res = await convertVoiceElevenLabs(inputAudio, selectedVoiceModel, elevenKey, (prog, txt) => {
+          setVoiceProgress(prog);
+          setVoiceStatusText(txt);
         });
         setConvertedVocalBlob(res.blob);
         setConvertedVocalUrl(res.url);
+        addToast('Voice conversion ElevenLabs berhasil!', 'info');
         setIsConvertingVoice(false);
-        addToast('info', 'AI Voice ElevenLabs Berhasil!');
+        checkCredit('elevenlabs', elevenKey);
         return;
-      } catch (err) {
-        console.warn('ElevenLabs Error:', err);
-        markKeyAsFailed('elevenlabs', elKey.key);
+      } catch (e) {
+        console.warn('ElevenLabs API warning, falling back:', e);
+        markKeyAsFailed('elevenlabs', elevenKey);
       }
     }
 
-    // Fallback to pitch
-    setVoiceStatusText('Memakai Efek Pitch Lokal sebagai cadangan...');
+    addToast('ℹ️ Provider API menolak permintaan — otomatis memakai Efek Pitch sebagai gantinya.', 'warn');
     try {
-      const res = await convertVoiceLocal(inputAudio, 'up_light');
+      const res = await convertVoiceLocal(inputAudio, selectedPitchPreset);
       setConvertedVocalBlob(res.blob);
       setConvertedVocalUrl(res.url);
-      addToast('warn', 'AI Voice ditolak/gagal. Otomatis memakai Efek Pitch.');
-    } catch (err) {
-      addToast('error', 'Gagal memproses konversi vokal.');
+    } catch (e) {
+      console.error('Fatal voice fallback error:', e);
+    } finally {
+      setIsConvertingVoice(false);
     }
-
-    setIsConvertingVoice(false);
   };
 
   const buildSunoStyleString = () => {
-    const parts = [selectedGenre, selectedMood, selectedInstruments.join(', ')];
+    const parts = [selectedGenre, selectedMood];
+    if (selectedInstruments && selectedInstruments.length > 0) {
+      parts.push(selectedInstruments.join(', '));
+    }
     if (selectedTempo === 'slow') parts.push('70 BPM');
-    if (selectedTempo === 'fast') parts.push('130 BPM');
-    if (selectedTempo === 'very_fast') parts.push('150 BPM');
+    else if (selectedTempo === 'medium') parts.push('100 BPM');
+    else if (selectedTempo === 'fast') parts.push('130 BPM');
+    else if (selectedTempo === 'very_fast') parts.push('150 BPM');
     return parts.join(', ').slice(0, 200);
   };
 
   const handleStartStyleRegeneration = async () => {
     const inputAudio = instStemUrl || audioUrl;
-    if (!inputAudio) return;
+    if (!inputAudio && genreMode === 'fast') return;
 
     setIsGeneratingGenre(true);
     setGenreProgress(10);
-    setGenreStatusText('Memulai pengubahan gaya instrumen...');
+    setGenreStatusText('Membuat gaya musik baru...');
 
     if (genreMode === 'fast') {
       try {
+        setGenreProgress(50);
+        setGenreStatusText('Menerapkan EQ & efek genre lokal...');
         const res = await applyLocalStyleEffect(inputAudio, selectedGenre, selectedMood, selectedTempo);
         setNewInstBlob(res.blob);
         setNewInstUrl(res.url);
-        addToast('info', 'Efek Gaya Musik Cepat Berhasil!');
-      } catch (err) {
-        console.warn('Local style error:', err);
-        addToast('error', 'Gagal menerapkan gaya musik.');
+        setGenreProgress(100);
+        addToast('Efek gaya musik instan diterapkan!', 'info');
+      } catch (e) {
+        console.warn('Fast genre effect warning:', e);
+        addToast('Gagal menerapkan efek gaya musik', 'error');
+      } finally {
+        setIsGeneratingGenre(false);
       }
-      setIsGeneratingGenre(false);
       return;
     }
 
-    // AI Mode Kie.ai
     const kieKey = getNextAvailableKey('kieai');
     if (kieKey) {
       try {
         const styleStr = buildSunoStyleString();
-        const res = await regenerateInstrumentalApi(
-          customStylePrompt,
-          styleStr,
-          selectedNegativeTags,
-          vocalGender,
-          kieKey.key,
-          (p, text) => {
-            setGenreProgress(p);
-            setGenreStatusText(text);
-          }
-        );
+        const res = await regenerateInstrumentalApi(customStylePrompt, styleStr, selectedNegativeTags, vocalGender, kieKey, (prog, txt) => {
+          setGenreProgress(prog);
+          setGenreStatusText(txt);
+        });
         setNewInstBlob(res.blob);
         setNewInstUrl(res.url);
+        addToast('Regenerasi musik AI Kie.ai berhasil!', 'info');
         setIsGeneratingGenre(false);
-        addToast('info', 'Regenerasi Musik AI Kie.ai Berhasil!');
+        checkCredit('kieai', kieKey);
         return;
-      } catch (err) {
-        console.warn('Kie.ai Error:', err);
-        markKeyAsFailed('kieai', kieKey.key);
+      } catch (e) {
+        console.warn('Kie.ai API warning, falling back to local effect:', e);
+        markKeyAsFailed('kieai', kieKey);
       }
     }
 
-    // Fallback
-    setGenreStatusText('Beralih ke Efek Cepat Gratis...');
+    addToast('ℹ️ Regenerasi AI tidak dapat dijangkau, memakai Efek Cepat sebagai gantinya.', 'warn');
     try {
       const res = await applyLocalStyleEffect(inputAudio, selectedGenre, selectedMood, selectedTempo);
       setNewInstBlob(res.blob);
       setNewInstUrl(res.url);
-      addToast('warn', 'Kie.ai tidak dapat dijangkau. Memakai Efek Cepat.');
-    } catch (err) {
-      addToast('error', 'Gagal mengubah gaya musik.');
+    } catch (e) {
+      console.error('Fatal style fallback error:', e);
+    } finally {
+      setIsGeneratingGenre(false);
     }
-
-    setIsGeneratingGenre(false);
   };
 
   const handleStartFinalMixing = async () => {
-    setIsMixing(true);
-    setMixProgress(10);
-    setMixStatusText('Menggabungkan track audio...');
+    const vAudio = convertedVocalUrl || vocalStemUrl;
+    const iAudio = newInstUrl || instStemUrl;
 
-    try {
-      const finalVocal = convertedVocalBlob || vocalStemBlob;
-      const finalInst = newInstBlob || instStemBlob;
-
-      if (!finalVocal || !finalInst) {
-        addToast('error', 'Vokal dan instrumen (baru atau asli) harus tersedia untuk digabungkan!');
-        setIsMixing(false);
-        return;
-      }
-
-      const res = await mixAudioTracks(finalVocal, finalInst, (p, text) => {
-        setMixProgress(p);
-        setMixStatusText(text);
-      });
-
-      setFinalCoverUrl(res.url);
-      addToast('info', 'Lagu Cover Final Berhasil Dibuat!');
-    } catch (err) {
-      console.error('[DEBUG-Mix] Fatal Error:', err);
-      addToast('error', 'Gagal menggabungkan audio.');
+    if (!vAudio || !iAudio) {
+      addToast('Diperlukan vokal dan instrumen untuk digabungkan!', 'error');
+      return;
     }
 
-    setIsMixing(false);
+    setIsMixing(true);
+    setMixProgress(10);
+    setMixStatusText('Memulai proses mixing audio final...');
+
+    try {
+      const res = await mixAudioTracks(vAudio, iAudio, (prog, txt) => {
+        setMixProgress(prog);
+        setMixStatusText(txt);
+      });
+      setFinalCoverUrl(res.url);
+      addToast('Hasil Cover Final berhasil dibuat!', 'info');
+    } catch (e) {
+      console.error('Final mixing error:', e);
+      addToast('Gagal menggabungkan audio track!', 'error');
+    } finally {
+      setIsMixing(false);
+    }
   };
 
   const hasVocal = Boolean(convertedVocalUrl || vocalStemUrl);
@@ -1257,16 +1282,15 @@ export default function App() {
                   <div className="grid grid-cols-2 gap-2.5 text-xs">
                     <div>
                       <label className="block mb-1 font-semibold text-slate-400">Genre</label>
-                      <select value={selectedGenre} onChange={e => setSelectedGenre(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-slate-200">
-                        <option value="Lofi">Lo-Fi</option>
-                        <option value="EDM">EDM</option>
-                        <option value="Acoustic">Acoustic</option>
-                        <option value="Cyberpunk">Cyberpunk</option>
+                      <select value={selectedGenre} onChange={e => setSelectedGenre(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-slate-200 focus:border-cyan-500 outline-none">
+                        {['Lo-Fi', 'EDM', 'Acoustic', 'Cyberpunk', 'Pop', 'Rock', 'Jazz'].map(g => (
+                          <option key={g} value={g}>{g}</option>
+                        ))}
                       </select>
                     </div>
                     <div>
                       <label className="block mb-1 font-semibold text-slate-400">Tempo</label>
-                      <select value={selectedTempo} onChange={e => setSelectedTempo(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-slate-200">
+                      <select value={selectedTempo} onChange={e => setSelectedTempo(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-slate-200 focus:border-cyan-500 outline-none">
                         <option value="slow">Lambat (80 BPM)</option>
                         <option value="medium">Sedang (100 BPM)</option>
                         <option value="fast">Cepat (130 BPM)</option>
@@ -1274,17 +1298,151 @@ export default function App() {
                     </div>
                   </div>
                 ) : (
-                  <div className="space-y-2.5 text-xs">
-                    <input 
-                      type="text"
-                      placeholder="Deskripsi gaya (misal: Jazz piano santai)"
-                      value={customStylePrompt}
-                      onChange={e => setCustomStylePrompt(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200 focus:border-cyan-500 outline-none"
-                    />
-                    <p className="text-[10px] font-mono-studio text-slate-400">Preview: {buildSunoStyleString()}</p>
-                    <p className="text-[10px] text-amber-300/80 italic">
-                      ℹ️ Mode ini menghasilkan instrumental baru dari deskripsi teks, bukan mengubah instrumental asli lagu Anda.
+                  <div className="space-y-3 text-xs">
+                    {/* Grid Dropdowns: Genre, Mood, Preferensi Vokal, Tempo */}
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block mb-1 font-semibold text-slate-300 text-[11px]">Genre Musik</label>
+                        <select 
+                          value={selectedGenre} 
+                          onChange={e => setSelectedGenre(e.target.value)} 
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-xs text-slate-200 focus:border-cyan-500 outline-none"
+                        >
+                          {['Pop', 'Rock', 'Jazz', 'Hip-Hop', 'Electronic/EDM', 'Classical', 'Lo-Fi', 'Acoustic', 'R&B', 'Country', 'Reggae', 'Funk', 'Ambient'].map(g => (
+                            <option key={g} value={g}>{g}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block mb-1 font-semibold text-slate-300 text-[11px]">Mood / Suasana</label>
+                        <select 
+                          value={selectedMood} 
+                          onChange={e => setSelectedMood(e.target.value)} 
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-xs text-slate-200 focus:border-cyan-500 outline-none"
+                        >
+                          {['Calm', 'Energetic', 'Happy', 'Sad', 'Dreamy', 'Dark', 'Uplifting', 'Nostalgic', 'Romantic', 'Epic'].map(m => (
+                            <option key={m} value={m}>{m}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block mb-1 font-semibold text-slate-300 text-[11px]">Preferensi Vokal</label>
+                        <select 
+                          value={vocalGender} 
+                          onChange={e => setVocalGender(e.target.value)} 
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-xs text-slate-200 focus:border-cyan-500 outline-none"
+                        >
+                          <option value="none">Tanpa Preferensi</option>
+                          <option value="m">Vokal Pria</option>
+                          <option value="f">Vokal Wanita</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block mb-1 font-semibold text-slate-300 text-[11px]">Tempo Lagu</label>
+                        <select 
+                          value={selectedTempo} 
+                          onChange={e => setSelectedTempo(e.target.value)} 
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-xs text-slate-200 focus:border-cyan-500 outline-none"
+                        >
+                          <option value="slow">Lambat (60-80 BPM)</option>
+                          <option value="medium">Sedang (90-110 BPM)</option>
+                          <option value="fast">Cepat (120-140 BPM)</option>
+                          <option value="very_fast">Sangat Cepat (150+ BPM)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Multi-select Chips: Instrumen Utama (max 3) */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label className="font-semibold text-slate-300 text-[11px]">Instrumen Utama (Maks. 3)</label>
+                        <span className="text-[10px] text-slate-400 font-mono-studio">{selectedInstruments.length}/3 dipilih</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {['Piano', 'Acoustic Guitar', 'Electric Guitar', 'Synth', 'Strings', 'Saxophone', 'Violin', 'Drums', 'Bass', 'Flute'].map(inst => {
+                          const isSelected = selectedInstruments.includes(inst);
+                          return (
+                            <button
+                              key={inst}
+                              type="button"
+                              onClick={() => {
+                                if (isSelected) {
+                                  setSelectedInstruments(prev => prev.filter(i => i !== inst));
+                                } else if (selectedInstruments.length < 3) {
+                                  setSelectedInstruments(prev => [...prev, inst]);
+                                }
+                              }}
+                              className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition-all border ${
+                                isSelected 
+                                  ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-[0_0_8px_rgba(34,211,238,0.3)]' 
+                                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              {isSelected ? '✓ ' : '+ '}{inst}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Multi-select Chips: Hindari / Negative Tags */}
+                    <div>
+                      <label className="block mb-1.5 font-semibold text-slate-300 text-[11px]">Hindari (Negative Tags - Opsional)</label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {['Heavy Metal', 'Distorsi Berat', 'Vokal Berteriak', 'Genre Anak-anak'].map(tag => {
+                          const isSelected = selectedNegativeTags.includes(tag);
+                          return (
+                            <button
+                              key={tag}
+                              type="button"
+                              onClick={() => {
+                                if (isSelected) {
+                                  setSelectedNegativeTags(prev => prev.filter(t => t !== tag));
+                                } else {
+                                  setSelectedNegativeTags(prev => [...prev, tag]);
+                                }
+                              }}
+                              className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition-all border ${
+                                isSelected 
+                                  ? 'bg-red-500/20 border-red-400 text-red-300 shadow-[0_0_8px_rgba(239,68,68,0.3)]' 
+                                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              {isSelected ? '✕ ' : '+ '}{tag}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Free-text prompt input (Optional supplement) */}
+                    <div>
+                      <label className="block mb-1 font-semibold text-slate-300 text-[11px]">
+                        Deskripsi Tambahan / Detail Gaya (Opsional)
+                      </label>
+                      <input 
+                        type="text"
+                        placeholder="misal: Solo saxophone lembut di tengah lagu"
+                        value={customStylePrompt}
+                        onChange={e => setCustomStylePrompt(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200 focus:border-cyan-500 outline-none"
+                      />
+                    </div>
+
+                    {/* Live Style Preview */}
+                    <div className="p-2 rounded-lg bg-slate-950/80 border border-cyan-500/20 text-[10px] font-mono-studio text-cyan-300 flex items-start gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-cyan-400 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-bold text-slate-300">Preview Gaya: </span>
+                        <span>{buildSunoStyleString()}</span>
+                      </div>
+                    </div>
+
+                    <p className="text-[10px] text-amber-300/80 italic leading-relaxed">
+                      ℹ️ Mode ini menghasilkan instrumental baru dari deskripsi pilihan & teks di atas, bukan mengubah instrumental asli lagu Anda. Vokal hasil pisahan tetap dipakai nanti di tahap akhir untuk digabung dengan instrumental baru ini.
                     </p>
                   </div>
                 )}
