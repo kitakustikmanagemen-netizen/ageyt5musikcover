@@ -674,6 +674,7 @@ export default function App() {
 
   // API Key Management State
   const [apiKeys, setApiKeys] = useState({
+    stemsplit: [],
     kitsai: [],
     elevenlabs: [],
     lalal: [],
@@ -681,7 +682,7 @@ export default function App() {
   });
 
   const [newKeyInput, setNewKeyInput] = useState({
-    service: 'kitsai',
+    service: 'stemsplit',
     key: '',
     label: ''
   });
@@ -873,6 +874,9 @@ export default function App() {
         } else {
           throw new Error('Format response Kie.ai tidak sesuai');
         }
+      } else if (service === 'stemsplit') {
+        updatedQuotaInfo = 'Cek saldo di dashboard StemSplit.io';
+        statusFlag = 'manual';
       } else {
         updatedQuotaInfo = 'Tidak tersedia via API — cek manual di dashboard';
         statusFlag = 'manual';
@@ -1022,6 +1026,185 @@ export default function App() {
     if (!keyStr || keyStr.length < 8) return '••••••••';
     return `${keyStr.slice(0, 4)}...${keyStr.slice(-4)}`;
   };
+
+  async function separateVocalsStemSplit(audioFile, apiKey, onProgressUpdate) {
+    console.log('[DEBUG-StemSplit] Memulai pemisahan vokal StemSplit.io...');
+    onProgressUpdate(10, 'Membuka koneksi ke StemSplit.io (Langkah A)...');
+
+    const fetchWithTimeout = async (url, options = {}, timeoutMs = 20000) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(timeoutId);
+        return response;
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          throw new Error(`Request timeout (${Math.round(timeoutMs / 1000)}s)`);
+        }
+        throw err;
+      }
+    };
+
+    try {
+      // LANGKAH A — Minta URL upload
+      console.log('[DEBUG-StemSplit] LANGKAH A: POST ke /api/v1/upload...');
+      const uploadRes = await fetchWithTimeout('https://stemsplit.io/api/v1/upload', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ filename: audioFile.name })
+      }, 20000);
+
+      if (!uploadRes.ok) {
+        let errBody = '';
+        try { errBody = await uploadRes.text(); } catch (e) {}
+        console.warn(`[DEBUG-StemSplit] Langkah A gagal (HTTP ${uploadRes.status}):`, errBody);
+        throw new Error(`StemSplit Upload Init Error (HTTP ${uploadRes.status}): ${errBody.slice(0, 300)}`);
+      }
+
+      const uploadData = await uploadRes.json();
+      console.log('[DEBUG-StemSplit] Response Langkah A:', uploadData);
+
+      const uploadUrl = uploadData.uploadUrl;
+      const uploadKey = uploadData.uploadKey;
+
+      if (!uploadUrl || !uploadKey) {
+        throw new Error('Gagal mendapatkan uploadUrl/uploadKey dari StemSplit.io');
+      }
+
+      // LANGKAH B — Upload file ke uploadUrl
+      onProgressUpdate(25, 'Mengunggah file audio ke StemSplit.io (Langkah B)...');
+      console.log('[DEBUG-StemSplit] LANGKAH B: PUT ke uploadUrl...');
+
+      const uploadFileRes = await fetchWithTimeout(uploadUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': audioFile.type || 'audio/mpeg'
+        },
+        body: audioFile
+      }, 60000);
+
+      if (!uploadFileRes.ok) {
+        let errBody = '';
+        try { errBody = await uploadFileRes.text(); } catch (e) {}
+        console.warn(`[DEBUG-StemSplit] Langkah B gagal (HTTP ${uploadFileRes.status}):`, errBody);
+        throw new Error(`StemSplit File Upload Error (HTTP ${uploadFileRes.status}): ${errBody.slice(0, 300)}`);
+      }
+
+      console.log('[DEBUG-StemSplit] File audio berhasil diunggah ke storage');
+
+      // LANGKAH C — Buat job pemisahan
+      onProgressUpdate(40, 'Membuat job pemisahan vokal (Langkah C)...');
+      console.log('[DEBUG-StemSplit] LANGKAH C: POST ke /api/v1/jobs...');
+
+      const jobRes = await fetchWithTimeout('https://stemsplit.io/api/v1/jobs', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          uploadKey: uploadKey,
+          outputType: 'BOTH',
+          quality: 'BEST',
+          outputFormat: 'MP3'
+        })
+      }, 20000);
+
+      if (!jobRes.ok) {
+        let errBody = '';
+        try { errBody = await jobRes.text(); } catch (e) {}
+        console.warn(`[DEBUG-StemSplit] Langkah C gagal (HTTP ${jobRes.status}):`, errBody);
+        throw new Error(`StemSplit Create Job Error (HTTP ${jobRes.status}): ${errBody.slice(0, 300)}`);
+      }
+
+      const jobData = await jobRes.json();
+      console.log('[DEBUG-StemSplit] Response Langkah C:', jobData);
+
+      const jobId = jobData.id || jobData.jobId;
+      if (!jobId) {
+        throw new Error('Gagal mendapatkan Job ID dari StemSplit.io');
+      }
+
+      console.log('[DEBUG-StemSplit] Job ID diterima:', jobId);
+
+      // LANGKAH D — Polling status job
+      let completed = false;
+      let pollCount = 0;
+      const MAX_POLLS = 40;
+      let resultData = null;
+
+      while (!completed) {
+        pollCount++;
+        if (pollCount > MAX_POLLS) {
+          throw new Error('Polling StemSplit melebihi batas waktu (~3.5 menit)');
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 5000));
+
+        console.log(`[DEBUG-StemSplit] LANGKAH D: Polling ke-${pollCount}, GET /jobs/${jobId}...`);
+
+        const statusRes = await fetchWithTimeout(`https://stemsplit.io/api/v1/jobs/${jobId}`, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${apiKey.trim()}`
+          }
+        }, 20000);
+
+        if (!statusRes.ok) {
+          let errBody = '';
+          try { errBody = await statusRes.text(); } catch (e) {}
+          console.warn(`[DEBUG-StemSplit] Polling ke-${pollCount} gagal (HTTP ${statusRes.status}):`, errBody);
+          throw new Error(`Polling status StemSplit gagal (HTTP ${statusRes.status})`);
+        }
+
+        const statusData = await statusRes.json();
+        console.log(`[DEBUG-StemSplit] Polling ke-${pollCount} response:`, statusData);
+
+        const status = statusData.status;
+        const progressVal = typeof statusData.progress === 'number' ? statusData.progress : Math.min(95, 40 + pollCount * 3);
+
+        onProgressUpdate(
+          Math.min(98, Math.max(40, progressVal)),
+          `Memproses pemisahan StemSplit (${status || 'PROCESSING'})...`
+        );
+
+        if (status === 'COMPLETED' || status === 'SUCCESS') {
+          console.log('[DEBUG-StemSplit] Job COMPLETED!');
+          completed = true;
+          resultData = statusData;
+        } else if (status === 'FAILED' || status === 'CANCELLED' || status === 'ERROR') {
+          const errMsg = statusData.errorMessage || statusData.error || `StemSplit job status: ${status}`;
+          throw new Error(errMsg);
+        }
+      }
+
+      onProgressUpdate(100, 'Pemisahan vokal StemSplit selesai!');
+
+      const outputs = resultData.outputs || {};
+      const vocalUrl = outputs.vocals?.url || outputs.vocal?.url || outputs.vocalsUrl || outputs.vocalUrl;
+      const instrumentalUrl = outputs.instrumental?.url || outputs.music?.url || outputs.instrumentalUrl || outputs.backing?.url;
+
+      if (!vocalUrl || !instrumentalUrl) {
+        console.warn('[DEBUG-StemSplit] Field outputs tidak lengkap:', outputs);
+        throw new Error('StemSplit selesai tetapi URL vokal/instrumental tidak ditemukan');
+      }
+
+      return {
+        vocalUrl,
+        instrumentalUrl,
+        isLocalFallback: false
+      };
+
+    } catch (err) {
+      console.warn('[DEBUG-StemSplit] Handled exception di separateVocalsStemSplit:', err.name, err.message);
+      throw err;
+    }
+  }
 
   const separateVocalsApi = async (audioFile, apiKey, onProgressUpdate) => {
     console.log('[DEBUG-KitsAI] Mengirim POST ke vocal-separations...');
@@ -1173,38 +1356,79 @@ export default function App() {
     let success = false;
 
     try {
-      const availableKeys = [
-        ...(apiKeys.kitsai || []).filter(k => k.status !== 'failed'),
-        ...(apiKeys.lalal || []).filter(k => k.status !== 'failed')
-      ];
-
-      if (availableKeys.length > 0) {
-        for (const keyObj of availableKeys) {
+      // 1. Coba StemSplit.io (Layanan Utama Baru)
+      const stemsplitKeys = (apiKeys.stemsplit || []).filter(k => k.status !== 'failed');
+      if (stemsplitKeys.length > 0) {
+        for (const keyObj of stemsplitKeys) {
           try {
-            setSeparationStep(`Memproses vokal dengan Kits.AI (${keyObj.label})...`);
+            setSeparationStep(`Memproses vokal dengan StemSplit.io (${keyObj.label})...`);
 
-            const result = await separateVocalsApi(uploadedFile, keyObj.key, (progress, stepMsg) => {
+            const result = await separateVocalsStemSplit(uploadedFile, keyObj.key, (progress, stepMsg) => {
               setSeparationProgress(progress);
               setSeparationStep(stepMsg);
             });
 
             setSeparatedVocalsUrl(result.vocalUrl);
             setSeparatedInstUrl(result.instrumentalUrl);
-            setIsUsingLocalFallback(!!result.isLocalFallback);
+            setIsUsingLocalFallback(false);
             success = true;
 
-            if (!result.isLocalFallback) {
-              checkCredit('kitsai', keyObj);
-              addToast('info', 'Pemisahan Selesai', 'Vokal dan instrumen berhasil dipisahkan via AI API.');
-            }
+            checkCredit('stemsplit', keyObj);
+            addToast('info', 'Pemisahan Selesai', 'Vokal dan instrumen berhasil dipisahkan via StemSplit.io API.');
             break;
           } catch (err) {
-            console.warn(`Handling API separation error for key ${keyObj.label}:`, err.message);
-            markKeyAsFailed('kitsai', keyObj.key, err.message.slice(0, 40));
+            console.warn(`Handling StemSplit API error for key ${keyObj.label}:`, err.message);
+            markKeyAsFailed('stemsplit', keyObj.key, err.message.slice(0, 40));
           }
         }
       }
 
+      // 2. Coba Kits.AI (Cadangan Pertama)
+      if (!success) {
+        const kitsKeys = (apiKeys.kitsai || []).filter(k => k.status !== 'failed');
+        if (kitsKeys.length > 0) {
+          for (const keyObj of kitsKeys) {
+            try {
+              setSeparationStep(`Memproses vokal dengan Kits.AI (${keyObj.label})...`);
+
+              const result = await separateVocalsApi(uploadedFile, keyObj.key, (progress, stepMsg) => {
+                setSeparationProgress(progress);
+                setSeparationStep(stepMsg);
+              });
+
+              setSeparatedVocalsUrl(result.vocalUrl);
+              setSeparatedInstUrl(result.instrumentalUrl);
+              setIsUsingLocalFallback(!!result.isLocalFallback);
+              success = true;
+
+              if (!result.isLocalFallback) {
+                checkCredit('kitsai', keyObj);
+                addToast('info', 'Pemisahan Selesai', 'Vokal dan instrumen berhasil dipisahkan via Kits.AI API.');
+              }
+              break;
+            } catch (err) {
+              console.warn(`Handling Kits.AI API error for key ${keyObj.label}:`, err.message);
+              markKeyAsFailed('kitsai', keyObj.key, err.message.slice(0, 40));
+            }
+          }
+        }
+      }
+
+      // 3. Coba LALAL.AI (Cadangan Kedua)
+      if (!success) {
+        const lalalKeys = (apiKeys.lalal || []).filter(k => k.status !== 'failed');
+        if (lalalKeys.length > 0) {
+          for (const keyObj of lalalKeys) {
+            try {
+              markKeyAsFailed('lalal', keyObj.key, '🔴 Belum ada endpoint otomatis');
+            } catch (err) {
+              markKeyAsFailed('lalal', keyObj.key, err.message.slice(0, 40));
+            }
+          }
+        }
+      }
+
+      // 4. Fallback ke DSP Lokal
       if (!success) {
         setSeparationStep('Mengalihkan ke Engine Pemisah Audio DSP Lokal (Client Browser)...');
         setIsUsingLocalFallback(true);
@@ -1221,7 +1445,7 @@ export default function App() {
       }
     } catch (err) {
       console.warn('Fatal error during audio separation:', err);
-      const errMsg = 'Semua API key Kits.AI gagal/kredit habis. Tools memakai DSP lokal sebagai gantinya.';
+      const errMsg = 'Semua API key pemisahan vokal gagal/kredit habis. Tools memakai DSP lokal sebagai gantinya.';
       setSeparationError(errMsg);
       addToast('error', 'Gagal Pemisahan Vokal', errMsg);
     }
@@ -1969,7 +2193,7 @@ export default function App() {
                 <Wand2 className="w-4 h-4 text-cyan-300" />
                 {isSeparating
                   ? 'Sedang Memisah Audio...'
-                  : (apiKeys.kitsai.length === 0 && apiKeys.lalal.length === 0)
+                  : (apiKeys.stemsplit.length === 0 && apiKeys.kitsai.length === 0 && apiKeys.lalal.length === 0)
                   ? 'Pisahkan Vokal (Akan Memakai DSP Lokal)'
                   : 'Pisahkan Vokal & Instrumen'}
               </button>
@@ -2344,6 +2568,7 @@ export default function App() {
                   onChange={(e) => setNewKeyInput(prev => ({ ...prev, service: e.target.value }))}
                   className="sm:col-span-4 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-slate-100 focus:outline-none focus:border-cyan-400"
                 >
+                  <option value="stemsplit">StemSplit.io (Utama)</option>
                   <option value="kitsai">Kits.AI</option>
                   <option value="elevenlabs">ElevenLabs</option>
                   <option value="lalal">LALAL.AI</option>
@@ -2380,9 +2605,10 @@ export default function App() {
             {/* List API Keys per Service */}
             <div className="space-y-4">
               {[
-                { id: 'kitsai', name: 'Kits.AI', desc: 'Model vokal AI & pemisahan stem' },
+                { id: 'stemsplit', name: 'StemSplit.io', desc: 'Pemisah vokal & instrumen AI presisi (Layanan Utama)' },
+                { id: 'kitsai', name: 'Kits.AI', desc: 'Model vokal AI & pemisahan stem (Cadangan 1)' },
                 { id: 'elevenlabs', name: 'ElevenLabs', desc: 'Sintesis suara vokal manusia' },
-                { id: 'lalal', name: 'LALAL.AI', desc: 'Pemisah musik & vokal' },
+                { id: 'lalal', name: 'LALAL.AI', desc: 'Pemisah musik & vokal (Cadangan 2)' },
                 { id: 'kieai', name: 'Kie.ai', desc: 'AI Music Generator Studio' }
               ].map((svc) => (
                 <div key={svc.id} className="p-3.5 rounded-xl border border-white/5 bg-slate-950/40 space-y-2">
@@ -2390,6 +2616,11 @@ export default function App() {
                     <div>
                       <h5 className="text-xs font-bold text-slate-200">{svc.name}</h5>
                       <p className="text-[10px] text-slate-400">{svc.desc}</p>
+                      {svc.id === 'stemsplit' && (
+                        <p className="text-[10px] text-cyan-400 font-medium mt-1">
+                          🎁 Akun gratis StemSplit.io mendapat 5 menit kredit pemrosesan gratis tanpa kartu kredit — cocok untuk mencoba tools ini.
+                        </p>
+                      )}
                     </div>
                     <span className="text-[10px] text-slate-400 font-mono bg-slate-900 px-2 py-0.5 rounded border border-white/5">
                       {apiKeys[svc.id].length} key tersimpan
