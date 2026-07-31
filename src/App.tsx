@@ -662,6 +662,85 @@ async function convertVoiceApi(vocalBlob, voiceModelId, apiKey, onProgressUpdate
 }
 
 /**
+ * Fetch ElevenLabs Voices List via Proxy Worker
+ */
+async function fetchElevenLabsVoices(apiKey) {
+  if (!apiKey || !apiKey.trim()) return null;
+  console.log('[DEBUG-ElevenLabs] Memuat daftar suara dari ElevenLabs via Proxy...');
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 20000);
+  try {
+    const res = await fetch('https://stemsplit-proxy.kitakustik-managemen.workers.dev/elevenlabs/v1/voices', {
+      headers: { 'xi-api-key': apiKey.trim() },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.voices && Array.isArray(data.voices)) {
+      return data.voices.map(v => ({ id: v.voice_id, name: `${v.name} (ElevenLabs)` }));
+    }
+    return null;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    console.warn('[DEBUG-ElevenLabs] Gagal memuat daftar suara:', err.message);
+    return null;
+  }
+}
+
+/**
+ * ElevenLabs Speech-to-Speech Voice Conversion via Cloudflare Worker Proxy
+ */
+async function convertVoiceElevenLabs(vocalBlob, voiceId, apiKey, onProgressUpdate) {
+  console.log('[DEBUG-ElevenLabs] Memulai Speech-to-Speech ElevenLabs via Proxy...');
+  onProgressUpdate(20, 'Mengirim stem vokal ke ElevenLabs via Proxy...');
+
+  const formData = new FormData();
+  formData.append('audio', vocalBlob, 'vocal.wav');
+  formData.append('model_id', 'eleven_multilingual_sts_v2');
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const response = await fetch(`https://stemsplit-proxy.kitakustik-managemen.workers.dev/elevenlabs/v1/speech-to-speech/${voiceId}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey.trim()
+      },
+      body: formData,
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      let errText = '';
+      try {
+        const errJson = await response.json();
+        errText = errJson.detail?.message || errJson.detail || JSON.stringify(errJson);
+      } catch (e) {
+        errText = await response.text();
+      }
+      throw new Error(`ElevenLabs API Error (HTTP ${response.status}): ${errText.slice(0, 300)}`);
+    }
+
+    onProgressUpdate(80, 'Menerima audio vokal baru dari ElevenLabs...');
+    const resultBlob = await response.blob();
+    onProgressUpdate(100, 'Konversi vokal ElevenLabs selesai!');
+
+    return {
+      vocalUrl: URL.createObjectURL(resultBlob),
+      vocalBlob: resultBlob,
+      serviceUsed: 'ElevenLabs'
+    };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    console.warn('[DEBUG-ElevenLabs] ElevenLabs Error:', err.message);
+    throw err;
+  }
+}
+
+/**
  * Kie.ai Instrumental Regeneration API
  */
 async function regenerateInstrumentalApi(stylePrompt, apiKey, onProgressUpdate) {
@@ -836,6 +915,13 @@ export default function App() {
         const data = await res.json();
         const remaining = data.character_limit - data.character_count;
         updateKeyStatus('elevenlabs', apiKey, remaining, `${remaining.toLocaleString()} / ${data.character_limit.toLocaleString()} karakter`);
+
+        // Memuat otomatis daftar suara resmi ElevenLabs saat key valid
+        const voices = await fetchElevenLabsVoices(apiKey);
+        if (voices && voices.length > 0) {
+          setVoiceModels(voices);
+          setSelectedVoiceModel(voices[0].id);
+        }
       } catch (err) {
         updateKeyStatus('elevenlabs', apiKey, 'failed', '🔴 Key Invalid / Error');
       }
@@ -1015,24 +1101,50 @@ export default function App() {
     setVoiceProgress(10);
     setVoiceStatusText('Mempersiapkan konversi vokal...');
 
+    let elevenKey = getNextAvailableKey('elevenlabs');
     let kitsKey = getNextAvailableKey('kitsai');
     let success = false;
 
-    if (kitsKey && vocalStemBlob) {
+    // Prioritas 1: ElevenLabs (Utama)
+    if (elevenKey) {
       try {
-        const res = await convertVoiceApi(vocalStemBlob, selectedVoiceModel, kitsKey, (p, text) => {
+        console.log('[DEBUG-VoiceConv] Mencoba ElevenLabs via Proxy...');
+        const vocalBlob = vocalStemBlob || await fetch(vocalStemUrl).then(r => r.blob());
+        const res = await convertVoiceElevenLabs(vocalBlob, selectedVoiceModel, elevenKey, (p, text) => {
+          setVoiceProgress(p);
+          setVoiceStatusText(text);
+        });
+        setConvertedVocalUrl(res.vocalUrl);
+        if (res.vocalBlob) setConvertedVocalBlob(res.vocalBlob);
+        success = true;
+        addToast('info', 'Konversi vokal AI berhasil via ElevenLabs!');
+        checkCredit('elevenlabs', elevenKey);
+      } catch (err) {
+        console.warn('[DEBUG-VoiceConv] ElevenLabs gagal, beralih ke cadangan...', err.message);
+        markKeyAsFailed('elevenlabs', elevenKey);
+      }
+    }
+
+    // Prioritas 2: Kits.AI (Cadangan)
+    if (!success && kitsKey) {
+      try {
+        console.log('[DEBUG-VoiceConv] Mencoba Kits.AI...');
+        const vocalBlob = vocalStemBlob || await fetch(vocalStemUrl).then(r => r.blob());
+        const res = await convertVoiceApi(vocalBlob, selectedVoiceModel, kitsKey, (p, text) => {
           setVoiceProgress(p);
           setVoiceStatusText(text);
         });
         setConvertedVocalUrl(res.vocalUrl);
         success = true;
-        addToast('info', 'Konversi vokal AI berhasil!');
+        addToast('info', 'Konversi vokal AI berhasil via Kits.AI!');
+        checkCredit('kitsai', kitsKey);
       } catch (err) {
         console.warn('[DEBUG-VoiceConv] Kits.AI Voice API gagal:', err.message);
         markKeyAsFailed('kitsai', kitsKey);
       }
     }
 
+    // Prioritas 3: Efek Pitch Shift Lokal (Jaring Pengaman Terakhir)
     if (!success) {
       try {
         const vocalBlob = vocalStemBlob || await fetch(vocalStemUrl).then(r => r.blob());
@@ -1563,6 +1675,9 @@ export default function App() {
                   ))}
                   {service === 'stemsplit' && (
                     <p className="text-[10px] text-slate-500">Akun gratis StemSplit.io mendapat 5 menit kredit pemrosesan gratis tanpa kartu kredit.</p>
+                  )}
+                  {service === 'elevenlabs' && (
+                    <p className="text-[10px] text-slate-500">Akun gratis ElevenLabs mendapat 10.000 kredit/bulan tanpa kartu kredit — cukup untuk beberapa kali konversi vokal.</p>
                   )}
                 </div>
               ))}
