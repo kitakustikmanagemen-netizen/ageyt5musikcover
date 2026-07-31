@@ -195,21 +195,31 @@ async function convertVoiceLocal(vocalBlob, effectType, onProgressUpdate) {
     filter.frequency.value = 2000;
     filter.gain.value = 15;
     source.detune.value = -300;
-  } else if (effectType === 'male') {
+  } else if (effectType === 'low' || effectType === 'male') {
     filter.type = 'lowshelf';
     filter.frequency.value = 300;
     filter.gain.value = 8;
     source.detune.value = -400;
-  } else if (effectType === 'female') {
+  } else if (effectType === 'chipmunk' || effectType === 'female' || effectType === 'high') {
     filter.type = 'highshelf';
     filter.frequency.value = 3000;
     filter.gain.value = 6;
     source.detune.value = 400;
-  } else { // child/jazz
+  } else if (effectType === 'up') {
     filter.type = 'peaking';
     filter.frequency.value = 1500;
-    filter.gain.value = 5;
+    filter.gain.value = 3;
     source.detune.value = 200;
+  } else if (effectType === 'down') {
+    filter.type = 'lowshelf';
+    filter.frequency.value = 400;
+    filter.gain.value = 4;
+    source.detune.value = -200;
+  } else { // normal
+    filter.type = 'peaking';
+    filter.frequency.value = 1000;
+    filter.gain.value = 0;
+    source.detune.value = 0;
   }
 
   source.connect(filter);
@@ -837,6 +847,8 @@ export default function App() {
   const [separationStatusText, setSeparationStatusText] = useState('');
 
   // Voice Conversion States
+  const [vocalMode, setVocalMode] = useState('free'); // 'free' or 'ai'
+  const [selectedPitchPreset, setSelectedPitchPreset] = useState('up');
   const [voiceModels, setVoiceModels] = useState([]);
   const [selectedVoiceModel, setSelectedVoiceModel] = useState('');
   const [isConvertingVoice, setIsConvertingVoice] = useState(false);
@@ -1152,11 +1164,7 @@ export default function App() {
     setVoiceProgress(10);
     setVoiceStatusText('Mempersiapkan konversi vokal...');
 
-    let elevenKey = getNextAvailableKey('elevenlabs');
-    let kitsKey = getNextAvailableKey('kitsai');
-    let success = false;
-
-    // Helper untuk mengambil Blob file vokal (menggunakan proxy relay-fetch jika URL eksternal StemSplit)
+    // Helper untuk mengambil Blob file vokal
     const fetchVocalBlob = async () => {
       if (vocalStemBlob) return vocalStemBlob;
       if (!vocalStemUrl) throw new Error('File vokal tidak ditemukan');
@@ -1171,6 +1179,28 @@ export default function App() {
       }
       return await response.blob();
     };
+
+    if (vocalMode === 'free') {
+      try {
+        const vocalBlob = await fetchVocalBlob();
+        const res = await convertVoiceLocal(vocalBlob, selectedPitchPreset, (p, text) => {
+          setVoiceProgress(p);
+          setVoiceStatusText(text);
+        });
+        setConvertedVocalUrl(res.url);
+        setConvertedVocalBlob(res.blob);
+        addToast('info', 'Konversi vokal selesai via Efek Pitch (Gratis).');
+      } catch (err) {
+        console.error('Local Voice Conversion Error:', err);
+        addToast('error', 'Gagal mengubah vokal secara lokal.');
+      }
+      setIsConvertingVoice(false);
+      return;
+    }
+
+    let elevenKey = getNextAvailableKey('elevenlabs');
+    let kitsKey = getNextAvailableKey('kitsai');
+    let success = false;
 
     // Prioritas 1: ElevenLabs (Utama)
     if (elevenKey) {
@@ -1211,17 +1241,17 @@ export default function App() {
       }
     }
 
-    // Prioritas 3: Efek Pitch Shift Lokal (Jaring Pengaman Terakhir)
+    // Prioritas 3: Efek Pitch Shift Lokal (Fallback)
     if (!success) {
       try {
         const vocalBlob = await fetchVocalBlob();
-        const res = await convertVoiceLocal(vocalBlob, 'male', (p, text) => {
+        const res = await convertVoiceLocal(vocalBlob, selectedPitchPreset || 'up', (p, text) => {
           setVoiceProgress(p);
           setVoiceStatusText(text);
         });
         setConvertedVocalUrl(res.url);
         setConvertedVocalBlob(res.blob);
-        addToast('warning', 'Konversi vokal selesai via Efek Pitch Lokal.');
+        addToast('warning', 'ℹ️ Provider API menolak permintaan (butuh langganan berbayar) — otomatis memakai Efek Pitch sebagai gantinya.');
       } catch (err) {
         console.error('Local Voice Conversion Error:', err);
         addToast('error', 'Gagal mengubah vokal.');
@@ -1464,37 +1494,95 @@ export default function App() {
         {/* Panel 2: Suara & Gaya */}
         <section className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           
-          {/* Sub-Panel A: Ubah Vokal */}
+          {/* Sub-Panel A: Ubah Karakter Vokal */}
           <div className="p-6 rounded-2xl bg-slate-900/40 border border-slate-800/80 backdrop-blur-xl shadow-xl flex flex-col justify-between">
             <div>
-              <div className="flex items-center gap-3 mb-6">
-                <div className="p-2 rounded-xl bg-pink-500/10 border border-pink-500/20 text-pink-400">
-                  <AudioLines className="w-5 h-5" />
-                </div>
-                <h2 className="text-lg font-bold text-slate-100">2A. Ubah Karakter Vokal</h2>
-              </div>
-
-              <div className="space-y-4 mb-6">
-                <label className="block text-xs font-semibold text-slate-400">Pilih Model Suara AI / Preset</label>
-                <select 
-                  value={selectedVoiceModel} 
-                  onChange={(e) => setSelectedVoiceModel(e.target.value)}
-                  className="w-full p-3 rounded-xl bg-slate-950 border border-slate-800 text-slate-200 text-sm focus:border-pink-500 focus:outline-none"
-                >
-                  {voiceModels.map(m => (
-                    <option key={m.id} value={m.id}>{m.name}</option>
-                  ))}
-                </select>
-
-                {convertedVocalUrl && (
-                  <div className="p-4 rounded-xl bg-slate-950/80 border border-pink-500/30 space-y-2 mt-4">
-                    <p className="text-xs font-bold text-pink-400 flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4" /> Hasil Vokal Baru Siap
-                    </p>
-                    <audio controls src={convertedVocalUrl} className="w-full h-8" />
+              <div className="flex items-center justify-between mb-6 flex-wrap gap-2">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 rounded-xl bg-pink-500/10 border border-pink-500/20 text-pink-400">
+                    <AudioLines className="w-5 h-5" />
                   </div>
-                )}
+                  <h2 className="text-lg font-bold text-slate-100">2A. Ubah Karakter Vokal</h2>
+                </div>
+
+                <div className="flex p-1 rounded-xl bg-slate-950 border border-slate-800 text-xs">
+                  <button 
+                    onClick={() => setVocalMode('free')}
+                    className={`px-3 py-1.5 rounded-lg transition-all ${vocalMode === 'free' ? 'bg-pink-600 text-white font-bold' : 'text-slate-400'}`}
+                  >
+                    🎚️ Efek Pitch (Gratis)
+                  </button>
+                  <button 
+                    onClick={() => setVocalMode('ai')}
+                    className={`px-3 py-1.5 rounded-lg transition-all ${vocalMode === 'ai' ? 'bg-pink-600 text-white font-bold' : 'text-slate-400'}`}
+                  >
+                    ✨ AI Voice (Perlu Langganan)
+                  </button>
+                </div>
               </div>
+
+              {vocalMode === 'free' ? (
+                <div className="space-y-4 mb-6">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-400 mb-1">Preset Efek Pitch</label>
+                    <select 
+                      value={selectedPitchPreset} 
+                      onChange={(e) => setSelectedPitchPreset(e.target.value)}
+                      className="w-full p-3 rounded-xl bg-slate-950 border border-slate-800 text-slate-200 text-sm focus:border-pink-500 focus:outline-none"
+                    >
+                      <option value="up">Pitch Naik (Ringan)</option>
+                      <option value="down">Pitch Turun (Ringan)</option>
+                      <option value="chipmunk">Nada Tinggi (Chipmunk)</option>
+                      <option value="low">Nada Rendah (Berat)</option>
+                      <option value="robot">Robotik</option>
+                      <option value="normal">Normal (Tanpa Efek)</option>
+                    </select>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed italic">
+                    Mode ini mengubah nada/pitch suara secara instan tanpa API — cocok untuk variasi ringan, bukan mengganti identitas vokal secara utuh.
+                  </p>
+
+                  {convertedVocalUrl && (
+                    <div className="p-4 rounded-xl bg-slate-950/80 border border-pink-500/30 space-y-2 mt-4">
+                      <p className="text-xs font-bold text-pink-400 flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4" /> Hasil Vokal Baru Siap
+                      </p>
+                      <audio controls src={convertedVocalUrl} className="w-full h-8" />
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-4 mb-6">
+                  <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-amber-200 text-xs flex items-start gap-2">
+                    <Info className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                    <p className="leading-relaxed">
+                      ⚠️ Fitur ini membutuhkan akun berlangganan berbayar di penyedia API (Kits.AI, ElevenLabs, atau LALAL.AI) — akun gratis tidak dapat memakai voice conversion asli karena kebijakan masing-masing provider. Efek Pitch (Gratis) tetap tersedia sebagai alternatif tanpa biaya.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-400 mb-1">Pilih Model Suara AI</label>
+                    <select 
+                      value={selectedVoiceModel} 
+                      onChange={(e) => setSelectedVoiceModel(e.target.value)}
+                      className="w-full p-3 rounded-xl bg-slate-950 border border-slate-800 text-slate-200 text-sm focus:border-pink-500 focus:outline-none"
+                    >
+                      {voiceModels.map(m => (
+                        <option key={m.id} value={m.id}>{m.name}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {convertedVocalUrl && (
+                    <div className="p-4 rounded-xl bg-slate-950/80 border border-pink-500/30 space-y-2 mt-4">
+                      <p className="text-xs font-bold text-pink-400 flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4" /> Hasil Vokal Baru Siap
+                      </p>
+                      <audio controls src={convertedVocalUrl} className="w-full h-8" />
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <button 
