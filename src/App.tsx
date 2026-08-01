@@ -1,44 +1,29 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
-  Music, Music2, Upload, RefreshCw, Trash2, Settings, HelpCircle, 
-  Sparkles, Download, AlertCircle, X, Activity, Layers, Sliders, Wand2, 
-  AudioLines, CheckCircle2, Headphones, Disc3, Radio, AudioWaveform, SlidersHorizontal, ChevronRight
+  Play, Pause, Download, Music, Sliders, RefreshCw, Trash2, Key, HelpCircle, 
+  CheckCircle2, AlertCircle, Info, Sparkles, Volume2, Mic, Radio, Headphones, 
+  Disc, AudioWaveform, Settings, X, Plus, ChevronDown, ChevronRight, Zap, RefreshCcw, SlidersHorizontal, Music2
 } from 'lucide-react';
 
-const fontStyles = `
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Sora:wght@400;600;700;800&display=swap');
-  
-  .font-sora { font-family: 'Sora', sans-serif; }
-  .font-mono-studio { font-family: 'JetBrains Mono', monospace; }
-  .font-sans-studio { font-family: 'Inter', sans-serif; }
-
-  @keyframes eqBar {
-    0%, 100% { height: 4px; }
-    50% { height: 18px; }
-  }
-  .animate-eq-1 { animation: eqBar 0.8s ease-in-out infinite; }
-  .animate-eq-2 { animation: eqBar 1.1s ease-in-out infinite 0.2s; }
-  .animate-eq-3 { animation: eqBar 0.9s ease-in-out infinite 0.4s; }
-  .animate-eq-4 { animation: eqBar 1.2s ease-in-out infinite 0.1s; }
-`;
-
-function audioBufferToWav(buffer) {
+/**
+ * Encodes an AudioBuffer into an uncompressed 16-bit PCM WAV Blob.
+ */
+function bufferToWav(buffer) {
   const numChannels = buffer.numberOfChannels;
   const sampleRate = buffer.sampleRate;
-  const format = 1;
+  const format = 1; // PCM
   const bitDepth = 16;
   
   let result;
   if (numChannels === 2) {
     const left = buffer.getChannelData(0);
     const right = buffer.getChannelData(1);
-    const length = left.length + right.length;
-    result = new Float32Array(length);
-    let index = 0;
-    for (let i = 0; i < buffer.length; i++) {
-      result[index++] = left[i];
-      result[index++] = right[i];
+    const interleaved = new Float32Array(left.length + right.length);
+    for (let src = 0, dst = 0; src < left.length; src++, dst += 2) {
+      interleaved[dst] = left[src];
+      interleaved[dst + 1] = right[src];
     }
+    result = interleaved;
   } else {
     result = buffer.getChannelData(0);
   }
@@ -48,55 +33,77 @@ function audioBufferToWav(buffer) {
   const arrayBuffer = new ArrayBuffer(bufferLength);
   const view = new DataView(arrayBuffer);
 
-  const writeString = (offset, string) => {
-    for (let i = 0; i < string.length; i++) {
-      view.setUint8(offset + i, string.charCodeAt(i));
-    }
-  };
-
-  writeString(0, 'RIFF');
+  /* RIFF identifier */
+  writeString(view, 0, 'RIFF');
+  /* RIFF chunk length */
   view.setUint32(4, 36 + dataLength, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
+  /* RIFF type */
+  writeString(view, 8, 'WAVE');
+  /* format chunk identifier */
+  writeString(view, 12, 'fmt ');
+  /* format chunk length */
   view.setUint32(16, 16, true);
+  /* sample format (raw) */
   view.setUint16(20, format, true);
+  /* channel count */
   view.setUint16(22, numChannels, true);
+  /* sample rate */
   view.setUint32(24, sampleRate, true);
+  /* byte rate (sample rate * block align) */
   view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
+  /* block align (channel count * bytes per sample) */
   view.setUint16(32, numChannels * (bitDepth / 8), true);
+  /* bits per sample */
   view.setUint16(34, bitDepth, true);
-  writeString(36, 'data');
+  /* data chunk identifier */
+  writeString(view, 36, 'data');
+  /* data chunk length */
   view.setUint32(40, dataLength, true);
 
+  /* Write 16-bit PCM samples */
   let offset = 44;
-  for (let i = 0; i < result.length; i++) {
+  for (let i = 0; i < result.length; i++, offset += 2) {
     const s = Math.max(-1, Math.min(1, result[i]));
     view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-    offset += 2;
   }
 
   return new Blob([arrayBuffer], { type: 'audio/wav' });
 }
 
-async function processLocalAudioSeparation(audioFile, onProgress) {
-  onProgress(10, 'Membaca file audio...');
-  const arrayBuffer = await audioFile.arrayBuffer();
-  
-  onProgress(30, 'Mendekode sinyal audio...');
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-  
-  const sampleRate = decodedBuffer.sampleRate;
-  const length = decodedBuffer.length;
+function writeString(view, offset, string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
 
-  onProgress(50, 'Memisah frekuensi vokal (Bandpass)...');
-  const offlineCtxVocal = new OfflineAudioContext(decodedBuffer.numberOfChannels, length, sampleRate);
+/**
+ * Client-side Web Audio DSP separation fallback.
+ */
+async function processLocalAudioSeparation(audioFile, onProgress) {
+  console.log('[DEBUG-Local] Mulai pemisahan vokal lokal...');
+  onProgress(20, 'Membaca file audio...');
+  
+  const arrayBuffer = await audioFile.arrayBuffer();
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  
+  onProgress(40, 'Mendekode data audio...');
+  console.log('[DEBUG-Local] Mulai decodeAudioData...');
+  const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  console.log('[DEBUG-Local] decodeAudioData selesai, durasi:', decodedBuffer.duration);
+
+  const duration = decodedBuffer.duration;
+  const sampleRate = decodedBuffer.sampleRate;
+
+  // Process Vocal Track (Bandpass filter focusing on 300Hz - 3400Hz)
+  onProgress(60, 'Mengekstrak trek vokal...');
+  console.log('[DEBUG-Local] Mulai render vocal track...');
+  const offlineCtxVocal = new OfflineAudioContext(decodedBuffer.numberOfChannels, duration * sampleRate, sampleRate);
   const srcVocal = offlineCtxVocal.createBufferSource();
   srcVocal.buffer = decodedBuffer;
 
   const bandpass = offlineCtxVocal.createBiquadFilter();
   bandpass.type = 'bandpass';
-  bandpass.frequency.value = 1000;
+  bandpass.frequency.value = 1200;
   bandpass.Q.value = 0.8;
 
   srcVocal.connect(bandpass);
@@ -104,17 +111,18 @@ async function processLocalAudioSeparation(audioFile, onProgress) {
   srcVocal.start(0);
 
   const renderedVocal = await offlineCtxVocal.startRendering();
-  const vocalBlob = audioBufferToWav(renderedVocal);
-  const vocalUrl = URL.createObjectURL(vocalBlob);
+  console.log('[DEBUG-Local] Vocal track selesai dirender');
 
-  onProgress(80, 'Memisah frekuensi instrumen (Notch)...');
-  const offlineCtxInst = new OfflineAudioContext(decodedBuffer.numberOfChannels, length, sampleRate);
+  // Process Instrumental Track (Notch filter cutting vocals)
+  onProgress(85, 'Mengekstrak trek instrumen...');
+  console.log('[DEBUG-Local] Mulai render instrumental track...');
+  const offlineCtxInst = new OfflineAudioContext(decodedBuffer.numberOfChannels, duration * sampleRate, sampleRate);
   const srcInst = offlineCtxInst.createBufferSource();
   srcInst.buffer = decodedBuffer;
 
   const notch = offlineCtxInst.createBiquadFilter();
   notch.type = 'notch';
-  notch.frequency.value = 1000;
+  notch.frequency.value = 1200;
   notch.Q.value = 1.2;
 
   srcInst.connect(notch);
@@ -122,102 +130,119 @@ async function processLocalAudioSeparation(audioFile, onProgress) {
   srcInst.start(0);
 
   const renderedInst = await offlineCtxInst.startRendering();
-  const instBlob = audioBufferToWav(renderedInst);
-  const instUrl = URL.createObjectURL(instBlob);
+  console.log('[DEBUG-Local] Instrumental track selesai dirender');
 
   onProgress(100, 'Pemisahan DSP lokal selesai!');
-  return { vocalBlob, instBlob, vocalUrl, instUrl };
+  
+  const vocalBlob = bufferToWav(renderedVocal);
+  const instBlob = bufferToWav(renderedInst);
+
+  return {
+    vocalUrl: URL.createObjectURL(vocalBlob),
+    instrumentalUrl: URL.createObjectURL(instBlob)
+  };
 }
 
-async function convertVoiceLocal(audioBlobOrUrl, pitchPreset) {
-  let blob = audioBlobOrUrl;
-  if (typeof audioBlobOrUrl === 'string') {
-    if (audioBlobOrUrl.startsWith('blob:')) {
-      blob = await fetch(audioBlobOrUrl).then(r => r.blob());
-    } else {
-      const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(audioBlobOrUrl)}`;
-      blob = await fetch(proxiedUrl).then(r => r.blob());
-    }
-  }
+/**
+ * Local Web Audio DSP Pitch Modification.
+ */
+async function convertVoiceLocal(vocalAudioSource, preset, onProgress) {
+  console.log('[DEBUG-LocalVoice] Modifikasi pitch lokal:', preset);
+  onProgress(30, 'Mempersiapkan efek pitch...');
 
-  const arrayBuffer = await blob.arrayBuffer();
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
-  let detuneCents = 0;
-  let playbackRate = 1.0;
-
-  switch (pitchPreset) {
-    case 'up_light': detuneCents = 200; break;
-    case 'down_light': detuneCents = -200; break;
-    case 'chipmunk': detuneCents = 700; playbackRate = 1.1; break;
-    case 'deep': detuneCents = -600; playbackRate = 0.95; break;
-    case 'robotic': detuneCents = 0; break;
-    default: detuneCents = 0; break;
-  }
-
-  const offlineCtx = new OfflineAudioContext(decodedBuffer.numberOfChannels, decodedBuffer.length, decodedBuffer.sampleRate);
-  const src = offlineCtx.createBufferSource();
-  src.buffer = decodedBuffer;
-  src.detune.value = detuneCents;
-  src.playbackRate.value = playbackRate;
-
-  if (pitchPreset === 'robotic') {
-    const filter = offlineCtx.createBiquadFilter();
-    filter.type = 'peaking';
-    filter.frequency.value = 1200;
-    filter.gain.value = 15;
-    src.connect(filter);
-    filter.connect(offlineCtx.destination);
+  let arrayBuffer;
+  if (typeof vocalAudioSource === 'string') {
+    const res = await fetch(vocalAudioSource);
+    arrayBuffer = await res.arrayBuffer();
   } else {
-    src.connect(offlineCtx.destination);
+    arrayBuffer = await vocalAudioSource.arrayBuffer();
   }
 
-  src.start(0);
-  const rendered = await offlineCtx.startRendering();
-  const resBlob = audioBufferToWav(rendered);
-  const resUrl = URL.createObjectURL(resBlob);
-
-  return { blob: resBlob, url: resUrl };
-}
-
-async function applyLocalStyleEffect(audioBlobOrUrl, genre, moodValue, tempoValue) {
-  let blob = audioBlobOrUrl;
-  if (typeof audioBlobOrUrl === 'string') {
-    if (audioBlobOrUrl.startsWith('blob:')) {
-      blob = await fetch(audioBlobOrUrl).then(r => r.blob());
-    } else {
-      const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(audioBlobOrUrl)}`;
-      blob = await fetch(proxiedUrl).then(r => r.blob());
-    }
-  }
-
-  const arrayBuffer = await blob.arrayBuffer();
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  onProgress(60, 'Mendekode vokal...');
   const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
-  const offlineCtx = new OfflineAudioContext(decodedBuffer.numberOfChannels, decodedBuffer.length, decodedBuffer.sampleRate);
+  const duration = decodedBuffer.duration;
+  const sampleRate = decodedBuffer.sampleRate;
+  const offlineCtx = new OfflineAudioContext(decodedBuffer.numberOfChannels, duration * sampleRate, sampleRate);
+  
   const src = offlineCtx.createBufferSource();
   src.buffer = decodedBuffer;
 
-  let rate = 1.0;
-  if (tempoValue === 'slow') rate = 0.85;
-  if (tempoValue === 'fast') rate = 1.15;
-  if (tempoValue === 'very_fast') rate = 1.3;
-  src.playbackRate.value = rate;
+  /* Configure pitch detune / playback rate based on preset */
+  switch (preset) {
+    case 'up':
+      src.detune.value = 300; // +3 semitones
+      break;
+    case 'down':
+      src.detune.value = -300; // -3 semitones
+      break;
+    case 'chipmunk':
+      src.detune.value = 700; // +7 semitones
+      break;
+    case 'deep':
+      src.detune.value = -600; // -6 semitones
+      break;
+    case 'robot':
+      src.detune.value = 0;
+      break;
+    default:
+      src.detune.value = 0;
+      break;
+  }
+
+  src.connect(offlineCtx.destination);
+  src.start(0);
+
+  onProgress(85, 'Menerapkan efek pitch...');
+  const rendered = await offlineCtx.startRendering();
+  onProgress(100, 'Efek pitch selesai diterapkan!');
+
+  const blob = bufferToWav(rendered);
+  return URL.createObjectURL(blob);
+}
+
+/**
+ * Applies local genre/EQ DSP effects to instrumental audio.
+ */
+async function applyLocalStyleEffect(instAudioSource, genre, mood, tempo, pitch, onProgress) {
+  onProgress(30, 'Mempersiapkan efek instrumen lokal...');
+
+  let arrayBuffer;
+  if (typeof instAudioSource === 'string') {
+    const res = await fetch(instAudioSource);
+    arrayBuffer = await res.arrayBuffer();
+  } else {
+    arrayBuffer = await instAudioSource.arrayBuffer();
+  }
+
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+  const duration = decodedBuffer.duration;
+  const sampleRate = decodedBuffer.sampleRate;
+  const offlineCtx = new OfflineAudioContext(decodedBuffer.numberOfChannels, duration * sampleRate, sampleRate);
+
+  const src = offlineCtx.createBufferSource();
+  src.buffer = decodedBuffer;
+
+  /* Playback Rate / Pitch adjustments */
+  if (pitch) {
+    src.detune.value = (pitch - 50) * 10; // -500 to +500 cents
+  }
 
   const filter = offlineCtx.createBiquadFilter();
-  if (genre === 'Lo-Fi' || genre === 'Lofi') {
+  if (genre === 'lofi') {
     filter.type = 'lowpass';
-    filter.frequency.value = 1800;
-  } else if (genre === 'EDM' || genre === 'Electronic/EDM') {
-    filter.type = 'peaking';
-    filter.frequency.value = 100;
-    filter.gain.value = 6;
-  } else if (genre === 'Cyberpunk') {
+    filter.frequency.value = 2500;
+  } else if (genre === 'edm') {
+    filter.type = 'highshelf';
+    filter.frequency.value = 4000;
+    filter.gain.value = 4;
+  } else if (genre === 'cyberpunk') {
     filter.type = 'bandpass';
-    filter.frequency.value = 1200;
-    filter.Q.value = 1.5;
+    filter.frequency.value = 1500;
+    filter.Q.value = 1.0;
   } else {
     filter.type = 'allpass';
   }
@@ -226,76 +251,88 @@ async function applyLocalStyleEffect(audioBlobOrUrl, genre, moodValue, tempoValu
   filter.connect(offlineCtx.destination);
   src.start(0);
 
+  onProgress(80, 'Menerapkan gaya instrumen...');
   const rendered = await offlineCtx.startRendering();
-  const resBlob = audioBufferToWav(rendered);
-  const resUrl = URL.createObjectURL(resBlob);
+  onProgress(100, 'Efek instrumen selesai!');
 
-  return { blob: resBlob, url: resUrl };
+  const blob = bufferToWav(rendered);
+  return URL.createObjectURL(blob);
 }
 
-async function mixAudioTracks(vocalBlobOrUrl, instBlobOrUrl, onProgress) {
-  onProgress(20, 'Mengunduh sinyal vokal dan instrumen...');
+/**
+ * Mixes two audio sources into a single WAV audio track.
+ */
+async function mixAudioTracks(vocalSource, instSource, onProgress) {
+  console.log('[DEBUG-Mix] Mulai mixing trek vokal dan instrumen...');
+  onProgress(20, 'Membaca trek vokal dan instrumen...');
 
-  let vBlob = vocalBlobOrUrl;
-  if (typeof vocalBlobOrUrl === 'string') {
-    if (vocalBlobOrUrl.startsWith('blob:')) {
-      vBlob = await fetch(vocalBlobOrUrl).then(r => r.blob());
-    } else {
-      const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(vocalBlobOrUrl)}`;
-      vBlob = await fetch(proxiedUrl).then(r => r.blob());
-    }
+  /* Fetch vocal buffer */
+  let vocalBuf;
+  if (typeof vocalSource === 'string') {
+    const res = await fetch(vocalSource);
+    const ab = await res.arrayBuffer();
+    const actx = new (window.AudioContext || window.webkitAudioContext)();
+    vocalBuf = await actx.decodeAudioData(ab);
+  } else {
+    const ab = await vocalSource.arrayBuffer();
+    const actx = new (window.AudioContext || window.webkitAudioContext)();
+    vocalBuf = await actx.decodeAudioData(ab);
   }
 
-  let iBlob = instBlobOrUrl;
-  if (typeof instBlobOrUrl === 'string') {
-    if (instBlobOrUrl.startsWith('blob:')) {
-      iBlob = await fetch(instBlobOrUrl).then(r => r.blob());
-    } else {
-      const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(instBlobOrUrl)}`;
-      iBlob = await fetch(proxiedUrl).then(r => r.blob());
-    }
+  /* Fetch instrumental buffer */
+  let instBuf;
+  if (typeof instSource === 'string') {
+    const res = await fetch(instSource);
+    const ab = await res.arrayBuffer();
+    const actx = new (window.AudioContext || window.webkitAudioContext)();
+    instBuf = await actx.decodeAudioData(ab);
+  } else {
+    const ab = await instSource.arrayBuffer();
+    const actx = new (window.AudioContext || window.webkitAudioContext)();
+    instBuf = await actx.decodeAudioData(ab);
   }
 
-  onProgress(40, 'Mendekode audio untuk mixing...');
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const vBuffer = await audioCtx.decodeAudioData(await vBlob.arrayBuffer());
-  const iBuffer = await audioCtx.decodeAudioData(await iBlob.arrayBuffer());
+  onProgress(50, 'Menyesuaikan durasi dan volume...');
+  const finalDuration = Math.min(vocalBuf.duration, instBuf.duration);
+  const sampleRate = vocalBuf.sampleRate;
 
-  const minDuration = Math.min(vBuffer.duration, iBuffer.duration);
-  const sampleRate = vBuffer.sampleRate;
-  const frameCount = Math.floor(minDuration * sampleRate);
+  const offlineCtx = new OfflineAudioContext(2, finalDuration * sampleRate, sampleRate);
 
-  onProgress(70, 'Menggabungkan jalur vokal dan instrumen...');
-  const offlineCtx = new OfflineAudioContext(2, frameCount, sampleRate);
+  /* Vocal Source Node */
+  const vocalSrcNode = offlineCtx.createBufferSource();
+  vocalSrcNode.buffer = vocalBuf;
+  const vocalGainNode = offlineCtx.createGain();
+  vocalGainNode.gain.value = 1.0; // Vocal prominent
+  vocalSrcNode.connect(vocalGainNode);
+  vocalGainNode.connect(offlineCtx.destination);
 
-  const vSrc = offlineCtx.createBufferSource();
-  vSrc.buffer = vBuffer;
-  const vGain = offlineCtx.createGain();
-  vGain.gain.value = 1.0;
-  vSrc.connect(vGain);
-  vGain.connect(offlineCtx.destination);
+  /* Instrumental Source Node */
+  const instSrcNode = offlineCtx.createBufferSource();
+  instSrcNode.buffer = instBuf;
+  const instGainNode = offlineCtx.createGain();
+  instGainNode.gain.value = 0.85; // Slightly lower instrumental
+  instSrcNode.connect(instGainNode);
+  instGainNode.connect(offlineCtx.destination);
 
-  const iSrc = offlineCtx.createBufferSource();
-  iSrc.buffer = iBuffer;
-  const iGain = offlineCtx.createGain();
-  iGain.gain.value = 0.85;
-  iSrc.connect(iGain);
-  iGain.connect(offlineCtx.destination);
+  vocalSrcNode.start(0);
+  instSrcNode.start(0);
 
-  vSrc.start(0);
-  iSrc.start(0);
-
-  onProgress(90, 'Merekam file final WAV...');
+  onProgress(80, 'Menggabungkan kedua trek...');
   const rendered = await offlineCtx.startRendering();
-  const finalBlob = audioBufferToWav(rendered);
-  const finalUrl = URL.createObjectURL(finalBlob);
+  console.log('[DEBUG-Mix] Mixing selesai, durasi:', rendered.duration);
 
-  onProgress(100, 'Mixing Selesai!');
-  return { blob: finalBlob, url: finalUrl };
+  onProgress(100, 'Cover lagu selesai digabungkan!');
+  const wavBlob = bufferToWav(rendered);
+  return URL.createObjectURL(wavBlob);
 }
 
+/**
+ * StemSplit.io Vocal Separation via Cloudflare Worker Proxy.
+ */
 async function separateVocalsStemSplit(audioFile, apiKey, onProgress) {
-  onProgress(10, 'Menghubungi StemSplit.io proxy...');
+  console.log('[DEBUG-StemSplit] LANGKAH A: Request upload URL via proxy...');
+  onProgress(10, 'Meminta permission upload ke StemSplit...');
+
   const uploadRes = await fetch('https://stemsplit-proxy.kitakustik-managemen.workers.dev/api/v1/upload', {
     method: 'POST',
     headers: {
@@ -306,26 +343,32 @@ async function separateVocalsStemSplit(audioFile, apiKey, onProgress) {
   });
 
   if (!uploadRes.ok) {
-    const text = await uploadRes.text();
-    throw new Error(`StemSplit Upload Error (HTTP ${uploadRes.status}): ${text.slice(0, 200)}`);
+    const errText = await uploadRes.text();
+    throw new Error(`StemSplit Upload Error (HTTP ${uploadRes.status}): ${errText.slice(0, 200)}`);
   }
 
   const uploadData = await uploadRes.json();
   const { uploadUrl, uploadKey } = uploadData;
 
-  onProgress(25, 'Mengunggah file audio ke storage...');
-  const proxiedUploadUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-upload?target=${encodeURIComponent(uploadUrl)}`;
-  const putRes = await fetch(proxiedUploadUrl, {
+  console.log('[DEBUG-StemSplit] LANGKAH B: Uploading audio file via proxy...');
+  onProgress(30, 'Mengunggah file audio ke StemSplit...');
+
+  const proxyUploadUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-upload?target=${encodeURIComponent(uploadUrl)}`;
+  const putRes = await fetch(proxyUploadUrl, {
     method: 'PUT',
-    headers: { 'Content-Type': audioFile.type || 'audio/mpeg' },
+    headers: {
+      'Content-Type': audioFile.type || 'audio/mpeg'
+    },
     body: audioFile
   });
 
   if (!putRes.ok) {
-    throw new Error(`StemSplit Upload File Gagal (HTTP ${putRes.status})`);
+    throw new Error(`Gagal mengunggah file ke StemSplit (HTTP ${putRes.status})`);
   }
 
-  onProgress(40, 'Membuat job pemisahan StemSplit...');
+  console.log('[DEBUG-StemSplit] LANGKAH C: Membuat job pemisahan...');
+  onProgress(50, 'Mendaftarkan job pemisahan audio...');
+
   const jobRes = await fetch('https://stemsplit-proxy.kitakustik-managemen.workers.dev/api/v1/jobs', {
     method: 'POST',
     headers: {
@@ -333,7 +376,7 @@ async function separateVocalsStemSplit(audioFile, apiKey, onProgress) {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      uploadKey,
+      uploadKey: uploadKey,
       outputType: 'BOTH',
       quality: 'BEST',
       outputFormat: 'MP3'
@@ -341,128 +384,142 @@ async function separateVocalsStemSplit(audioFile, apiKey, onProgress) {
   });
 
   if (!jobRes.ok) {
-    const text = await jobRes.text();
-    throw new Error(`StemSplit Job Create Error (HTTP ${jobRes.status}): ${text.slice(0, 200)}`);
+    const errText = await jobRes.text();
+    throw new Error(`StemSplit Job Error (HTTP ${jobRes.status}): ${errText.slice(0, 200)}`);
   }
 
   const jobData = await jobRes.json();
   const jobId = jobData.id;
 
+  console.log('[DEBUG-StemSplit] LANGKAH D: Polling status job ID:', jobId);
   let completed = false;
   let attempts = 0;
-  let resultVocalsUrl = null;
-  let resultInstUrl = null;
+  let resultUrls = null;
 
   while (!completed && attempts < 40) {
     attempts++;
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 5000)); // Poll every 5s
 
     const pollRes = await fetch(`https://stemsplit-proxy.kitakustik-managemen.workers.dev/api/v1/jobs/${jobId}`, {
-      headers: { 'Authorization': `Bearer ${apiKey}` }
+      headers: {
+        'Authorization': `Bearer ${apiKey}`
+      }
     });
 
     if (!pollRes.ok) continue;
 
     const pollData = await pollRes.json();
-    const progressVal = pollData.progress || Math.min(40 + attempts * 2, 95);
-    onProgress(progressVal, `Pemisahan StemSplit berjalan... (${progressVal}%)`);
+    console.log('[DEBUG-StemSplit] Polling response:', pollData);
+
+    const progress = pollData.progress || 50;
+    onProgress(50 + Math.floor((progress / 100) * 45), `Memisahkan trek (${progress}%)...`);
 
     if (pollData.status === 'COMPLETED') {
       completed = true;
-      resultVocalsUrl = pollData.outputs?.vocals?.url || pollData.outputs?.vocal?.url;
-      resultInstUrl = pollData.outputs?.instrumental?.url || pollData.outputs?.backing?.url;
+      resultUrls = {
+        vocalUrl: pollData.outputs?.vocals?.url || pollData.outputs?.vocal?.url,
+        instrumentalUrl: pollData.outputs?.instrumental?.url || pollData.outputs?.backing?.url
+      };
     } else if (pollData.status === 'FAILED') {
       throw new Error(`StemSplit Job Gagal: ${pollData.errorMessage || 'Unknown Error'}`);
     }
   }
 
-  if (!completed || !resultVocalsUrl || !resultInstUrl) {
-    throw new Error('StemSplit polling timeout atau URL hasil tidak lengkap.');
+  if (!resultUrls?.vocalUrl || !resultUrls?.instrumentalUrl) {
+    throw new Error('StemSplit polling melebihi batas waktu (3 menit).');
   }
 
-  onProgress(95, 'Mengunduh stem vokal dan instrumen...');
-  const vProxy = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(resultVocalsUrl)}`;
-  const iProxy = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(resultInstUrl)}`;
-
-  const vocalBlob = await fetch(vProxy).then(r => r.blob());
-  const instBlob = await fetch(iProxy).then(r => r.blob());
-
-  return {
-    vocalBlob,
-    instBlob,
-    vocalUrl: URL.createObjectURL(vocalBlob),
-    instUrl: URL.createObjectURL(instBlob)
-  };
+  onProgress(100, 'StemSplit selesai memisahkan trek!');
+  return resultUrls;
 }
 
-async function convertVoiceElevenLabs(vocalStemBlobOrUrl, voiceId, apiKey, onProgress) {
-  onProgress(20, 'Menyiapkan stem vokal...');
-  let blob = vocalStemBlobOrUrl;
-  if (typeof vocalStemBlobOrUrl === 'string') {
-    if (vocalStemBlobOrUrl.startsWith('blob:')) {
-      blob = await fetch(vocalStemBlobOrUrl).then(r => r.blob());
-    } else {
-      const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(vocalStemBlobOrUrl)}`;
-      blob = await fetch(proxiedUrl).then(r => r.blob());
-    }
+/**
+ * ElevenLabs Speech-to-Speech Voice Conversion via Proxy.
+ */
+async function convertVoiceElevenLabs(vocalAudioSource, voiceId, apiKey, onProgress) {
+  console.log('[DEBUG-ElevenLabs] Memulai konversi vokal via proxy...');
+  onProgress(20, 'Mengambil data file vokal...');
+
+  let vocalBlob;
+  if (typeof vocalAudioSource === 'string') {
+    console.log('[DEBUG-ElevenLabs] Mengambil file vokal via proxy relay-fetch...');
+    const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(vocalAudioSource)}`;
+    const res = await fetch(proxiedUrl);
+    vocalBlob = await res.blob();
+  } else {
+    vocalBlob = vocalAudioSource;
   }
 
-  onProgress(40, 'Mengirim ke ElevenLabs Speech-to-Speech API...');
+  onProgress(40, 'Mengirim file vokal ke ElevenLabs...');
   const formData = new FormData();
-  formData.append('audio', blob, 'vocal.wav');
+  formData.append('audio', vocalBlob, 'vocal.wav');
   formData.append('model_id', 'eleven_multilingual_sts_v2');
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60000);
 
   const res = await fetch(`https://stemsplit-proxy.kitakustik-managemen.workers.dev/elevenlabs/v1/speech-to-speech/${voiceId}`, {
     method: 'POST',
-    headers: { 'xi-api-key': apiKey },
-    body: formData,
-    signal: controller.signal
+    headers: {
+      'xi-api-key': apiKey
+    },
+    body: formData
   });
-  clearTimeout(timer);
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`ElevenLabs Error (HTTP ${res.status}): ${errText.slice(0, 200)}`);
+    throw new Error(`ElevenLabs API Error (HTTP ${res.status}): ${errText.slice(0, 200)}`);
   }
 
-  onProgress(90, 'Menerima hasil konversi suara...');
-  const resultBlob = await res.blob();
-  const resultUrl = URL.createObjectURL(resultBlob);
-
-  onProgress(100, 'Konversi vokal selesai!');
-  return { blob: resultBlob, url: resultUrl };
+  onProgress(90, 'Memproses audio hasil ElevenLabs...');
+  const audioBlob = await res.blob();
+  onProgress(100, 'Konversi vokal ElevenLabs selesai!');
+  return URL.createObjectURL(audioBlob);
 }
 
+/**
+ * Kie.ai AI Music Regeneration API (Model V4).
+ */
 async function regenerateInstrumentalApi(prompt, styleString, negativeTags, vocalGender, apiKey, onProgress) {
+  console.log('[DEBUG-KieAI] Menghubungi Kie.ai API...');
   onProgress(15, 'Menghubungi Kie.ai API (Model V4)...');
 
-  const promptText = prompt && prompt.trim() !== '' 
-    ? prompt 
-    : `Custom instrumental cover track`;
+  const promptText = prompt && prompt.trim() !== '' ? prompt : 'Custom instrumental cover track';
 
+  /* Explicitly include model: "V4" in payload to prevent HTTP 422 null error */
   const payload = {
     customMode: true,
+    model: 'V4',
     prompt: promptText,
     style: styleString || 'Acoustic, Calm',
     negativeTags: Array.isArray(negativeTags) ? negativeTags.join(', ') : (negativeTags || ''),
-    title: 'Custom Style Cover'
+    title: 'Custom Style Cover',
+    instrumental: true
   };
 
   if (vocalGender && vocalGender !== 'none') {
     payload.vocalGender = vocalGender;
   }
 
-  const res = await fetch('https://api.kie.ai/api/v1/generate', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  let res;
+  try {
+    res = await fetch('https://api.kie.ai/api/v1/generate', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Request ke Kie.ai timeout setelah 30 detik.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!res.ok) {
     const errText = await res.text();
@@ -470,9 +527,16 @@ async function regenerateInstrumentalApi(prompt, styleString, negativeTags, voca
   }
 
   const json = await res.json();
-  const taskId = json.data?.taskId || json.data?.id;
 
-  if (!taskId) throw new Error('Kie.ai tidak mengembalikan Task ID.');
+  /* Validate response code explicitly */
+  if (json.code !== undefined && json.code !== 200) {
+    throw new Error(`Kie.ai menolak: ${json.msg || `Terjadi kesalahan (Code ${json.code})`}`);
+  }
+
+  const taskId = json.data?.taskId || json.data?.id;
+  if (!taskId) {
+    throw new Error('Kie.ai tidak mengembalikan Task ID.');
+  }
 
   let completed = false;
   let attempts = 0;
@@ -480,1159 +544,1091 @@ async function regenerateInstrumentalApi(prompt, styleString, negativeTags, voca
 
   while (!completed && attempts < 25) {
     attempts++;
-    await new Promise(r => setTimeout(r, 8000));
+    onProgress(15 + Math.floor((attempts / 25) * 80), `Memproses musik AI (${attempts}/25)...`);
+    
+    await new Promise(r => setTimeout(r, 8000)); // Poll every 8s
 
-    const pollRes = await fetch(`https://api.kie.ai/api/v1/generate/record-info?taskId=${taskId}`, {
-      headers: { 'Authorization': `Bearer ${apiKey}` }
-    });
+    const pollController = new AbortController();
+    const pollTimeout = setTimeout(() => pollController.abort(), 30000);
+    
+    let pollRes;
+    try {
+      pollRes = await fetch(`https://api.kie.ai/api/v1/generate/record-info?taskId=${taskId}`, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`
+        },
+        signal: pollController.signal
+      });
+    } catch (err) {
+      console.warn('[DEBUG-KieAI] Polling timeout/error:', err);
+      continue;
+    } finally {
+      clearTimeout(pollTimeout);
+    }
 
     if (!pollRes.ok) continue;
 
-    const pollData = await pollRes.json();
-    const status = pollData.data?.status || pollData.status;
+    const pollJson = await pollRes.json();
+    console.log('[DEBUG-KieAI] Polling response:', pollJson);
 
-    onProgress(20 + attempts * 3, `AI sedang meregenerasi musik... (${status || 'PROCESSING'})`);
-
+    const status = pollJson.data?.status || pollJson.status;
+    
     if (status === 'SUCCESS') {
       completed = true;
-      const records = pollData.data?.response?.sunoData || pollData.data?.records || [];
-      audioResultUrl = records[0]?.audioUrl || records[0]?.audio_url;
-    } else if (status === 'CREATE_TASK_FAILED') {
-      throw new Error('Kie.ai Task Generation Gagal.');
+      audioResultUrl = pollJson.data?.response?.sunoData?.[0]?.audioUrl 
+        || pollJson.data?.audioUrl 
+        || pollJson.data?.sunoData?.[0]?.audioUrl
+        || pollJson.data?.response?.[0]?.audioUrl;
+    } else if (status === 'CREATE_TASK_FAILED' || status === 'FAILED') {
+      throw new Error(`Kie.ai pemrosesan gagal: ${pollJson.data?.failReason || 'Task Failed'}`);
     }
   }
 
-  if (!completed || !audioResultUrl) {
-    throw new Error('Regenerasi Kie.ai timeout.');
+  if (!audioResultUrl) {
+    throw new Error('Polling Kie.ai melebihi batas waktu (3.5 menit).');
   }
 
-  const resultBlob = await fetch(audioResultUrl).then(r => r.blob());
-  return { blob: resultBlob, url: URL.createObjectURL(resultBlob) };
+  onProgress(100, 'Musik AI berhasil dibuat!');
+  return audioResultUrl;
+}
+
+/**
+ * Builds Suno Style string formatted for Kie.ai / Suno model.
+ */
+function buildSunoStyleString(genre, mood, instruments, tempo) {
+  const parts = [];
+  if (genre) parts.push(genre);
+  if (mood) parts.push(mood);
+  if (instruments && instruments.length > 0) parts.push(instruments.join(', '));
+  if (tempo) parts.push(tempo);
+  parts.push('high quality production');
+  return parts.join(', ').slice(0, 200);
 }
 
 export default function App() {
   const [loaded, setLoaded] = useState(false);
-  const [showApiSettingsModal, setShowApiSettingsModal] = useState(false);
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [showHelpModal, setShowHelpModal] = useState(false);
-  const [activeApiKeyTab, setActiveApiKeyTab] = useState('stemsplit');
+  const [modalServiceTab, setModalServiceTab] = useState('stemsplit');
+
+  /* Toast Notification state */
   const [toasts, setToasts] = useState([]);
 
-  // File Upload State
-  const [uploadedFile, setUploadedFile] = useState(null);
+  const addToast = useCallback((type, message) => {
+    const id = Date.now() + Math.random().toString(36).substr(2, 4);
+    setToasts(prev => [...prev, { id, type, message }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 6000);
+  }, []);
+
+  const removeToast = useCallback((id) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  }, []);
+
+  /* Audio Upload State */
+  const [audioFile, setAudioFile] = useState(null);
   const [audioUrl, setAudioUrl] = useState(null);
+  const [audioDuration, setAudioDuration] = useState(0);
   const [uploadError, setUploadError] = useState(null);
   const fileInputRef = useRef(null);
 
-  // API Key Storage
+  /* Stem Separation State */
+  const [isSeparating, setIsSeparating] = useState(false);
+  const [separationProgress, setSeparationProgress] = useState(0);
+  const [separationStatus, setSeparationStatus] = useState('');
+  const [originalVocalUrl, setOriginalVocalUrl] = useState(null);
+  const [originalInstrumentalUrl, setOriginalInstrumentalUrl] = useState(null);
+  const [vocalSeparationEngine, setVocalSeparationEngine] = useState('stemsplit');
+
+  /* Voice Conversion State (Panel 2A) */
+  const [vocalMode, setVocalMode] = useState('pitch'); // 'pitch' or 'aivoice'
+  const [pitchPreset, setPitchPreset] = useState('up');
+  const [aiVoiceModel, setAiVoiceModel] = useState('');
+  const [aiVoiceList, setAiVoiceList] = useState([
+    { voice_id: 'preset_m_pop', name: 'Vokal Pria - Pop' },
+    { voice_id: 'preset_f_jazz', name: 'Vokal Wanita - Jazz' },
+    { voice_id: 'preset_m_robot', name: 'Vokal Robotik' },
+    { voice_id: 'preset_child', name: 'Vokal Anak' }
+  ]);
+  const [convertedVocalUrl, setConvertedVocalUrl] = useState(null);
+  const [isConvertingVoice, setIsConvertingVoice] = useState(false);
+  const [voiceConversionProgress, setVoiceConversionProgress] = useState(0);
+  const [voiceConversionStatus, setVoiceConversionStatus] = useState('');
+
+  /* Style Adaptation State (Panel 2B) */
+  const [styleMode, setStyleMode] = useState('fast'); // 'fast' or 'ai'
+  const [fastGenre, setFastGenre] = useState('lofi');
+  const [fastMood, setFastMood] = useState(50);
+  const [fastTempo, setFastTempo] = useState(50);
+  const [fastPitch, setFastPitch] = useState(50);
+
+  /* AI Style Options */
+  const [aiGenre, setAiGenre] = useState('Lo-Fi');
+  const [aiMood, setAiMood] = useState('Calm');
+  const [aiInstruments, setAiInstruments] = useState(['Piano']);
+  const [aiVocalGender, setAiVocalGender] = useState('none');
+  const [aiTempo, setAiTempo] = useState('Sedang (90-110 BPM)');
+  const [aiNegativeTags, setAiNegativeTags] = useState([]);
+  const [aiFreePrompt, setAiFreePrompt] = useState('');
+
+  const [newInstrumentalUrl, setNewInstrumentalUrl] = useState(null);
+  const [isRegeneratingStyle, setIsRegeneratingStyle] = useState(false);
+  const [styleProgress, setStyleProgress] = useState(0);
+  const [styleStatus, setStyleStatus] = useState('');
+
+  /* Final Mixing State (Panel 3) */
+  const [finalCoverUrl, setFinalCoverUrl] = useState(null);
+  const [isMixing, setIsMixing] = useState(false);
+  const [mixProgress, setMixProgress] = useState(0);
+  const [mixStatusText, setMixStatusText] = useState('');
+
+  /* API Keys State */
   const [apiKeys, setApiKeys] = useState({
     stemsplit: [],
-    kitsai: [],
     elevenlabs: [],
+    kitsai: [],
     lalal: [],
     kieai: []
   });
+
   const [tempKeyInputs, setTempKeyInputs] = useState({
     stemsplit: '',
-    kitsai: '',
     elevenlabs: '',
+    kitsai: '',
     lalal: '',
     kieai: ''
   });
 
-  // Process & Separation States
   const [localFallbackInfo, setLocalFallbackInfo] = useState(null);
-  const [vocalStemUrl, setVocalStemUrl] = useState(null);
-  const [vocalStemBlob, setVocalStemBlob] = useState(null);
-  const [instStemUrl, setInstStemUrl] = useState(null);
-  const [instStemBlob, setInstStemBlob] = useState(null);
-  const [isSeparating, setIsSeparating] = useState(false);
-  const [sepProgress, setSepProgress] = useState(0);
-  const [sepStatusText, setSepStatusText] = useState('');
-
-  // Voice Mode & Options
-  const [voiceMode, setVoiceMode] = useState('pitch');
-  const [selectedPitchPreset, setSelectedPitchPreset] = useState('up_light');
-  const [selectedVoiceModel, setSelectedVoiceModel] = useState('');
-  const [convertedVocalUrl, setConvertedVocalUrl] = useState(null);
-  const [convertedVocalBlob, setConvertedVocalBlob] = useState(null);
-  const [isConvertingVoice, setIsConvertingVoice] = useState(false);
-  const [voiceProgress, setVoiceProgress] = useState(0);
-  const [voiceStatusText, setVoiceStatusText] = useState('');
-
-  // Style & Genre Options
-  const [genreMode, setGenreMode] = useState('fast');
-  const [selectedGenre, setSelectedGenre] = useState('Lo-Fi');
-  const [selectedMood, setSelectedMood] = useState('Calm');
-  const [selectedTempo, setSelectedTempo] = useState('medium');
-  const [vocalGender, setVocalGender] = useState('none');
-  const [selectedInstruments, setSelectedInstruments] = useState(['Piano', 'Acoustic Guitar']);
-  const [selectedNegativeTags, setSelectedNegativeTags] = useState([]);
-  const [customStylePrompt, setCustomStylePrompt] = useState('');
-  const [newInstUrl, setNewInstUrl] = useState(null);
-  const [newInstBlob, setNewInstBlob] = useState(null);
-  const [isGeneratingGenre, setIsGeneratingGenre] = useState(false);
-  const [genreProgress, setGenreProgress] = useState(0);
-  const [genreStatusText, setGenreStatusText] = useState('');
-
-  // Mixing & Cover Final
-  const [isMixing, setIsMixing] = useState(false);
-  const [mixProgress, setMixProgress] = useState(0);
-  const [mixStatusText, setMixStatusText] = useState('');
-  const [finalCoverUrl, setFinalCoverUrl] = useState(null);
 
   useEffect(() => {
     setLoaded(true);
   }, []);
 
-  const addToast = (text, type = 'info') => {
-    const id = Date.now();
-    setToasts(prev => [...prev, { id, text, type }]);
-    setTimeout(() => {
-      removeToast(id);
-    }, 6000);
-  };
+  /* Key Rotation & Availability Helpers */
+  const getNextAvailableKey = useCallback((service) => {
+    const serviceKeys = apiKeys[service] || [];
+    return serviceKeys.find(k => k.status !== 'failed' && k.key.trim() !== '');
+  }, [apiKeys]);
 
-  const removeToast = (id) => {
-    setToasts(prev => prev.filter(t => t.id !== id));
-  };
+  const markKeyAsFailed = useCallback((service, keyString) => {
+    setApiKeys(prev => ({
+      ...prev,
+      [service]: (prev[service] || []).map(k => k.key === keyString ? { ...k, status: 'failed' } : k)
+    }));
+  }, []);
 
-  const handleFileSelect = (file) => {
-    if (!file) return;
-    setUploadError(null);
-
-    const validTypes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-wav'];
-    const ext = file.name.split('.').pop().toLowerCase();
-
-    if (!validTypes.includes(file.type) && ext !== 'mp3' && ext !== 'wav') {
-      setUploadError('Format file tidak didukung! Harap upload file .mp3 atau .wav.');
-      addToast('Format file tidak didukung!', 'error');
-      return;
-    }
-
-    if (file.size > 50 * 1024 * 1024) {
-      setUploadError('Ukuran file terlalu besar! Maksimal 50MB.');
-      addToast('File melebihi batas 50MB!', 'error');
-      return;
-    }
-
-    setUploadedFile(file);
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    setAudioUrl(URL.createObjectURL(file));
-
-    // Reset downstream states
-    setVocalStemUrl(null);
-    setInstStemUrl(null);
-    setConvertedVocalUrl(null);
-    setNewInstUrl(null);
-    setFinalCoverUrl(null);
-    setLocalFallbackInfo(null);
-    addToast(`File "${file.name}" berhasil diunggah`, 'info');
-  };
-
-  const handleLoadSampleSong = () => {
-    const sampleAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const duration = 4.0;
-    const sampleRate = sampleAudioCtx.sampleRate;
-    const buffer = sampleAudioCtx.createBuffer(2, duration * sampleRate, sampleRate);
-
-    for (let channel = 0; channel < 2; channel++) {
-      const data = buffer.getChannelData(channel);
-      for (let i = 0; i < buffer.length; i++) {
-        const t = i / sampleRate;
-        const melody = Math.sin(2 * Math.PI * 440 * t) * 0.3 * Math.exp(-t * 0.5);
-        const chord = Math.sin(2 * Math.PI * 261.63 * t) * 0.2;
-        data[i] = melody + chord;
-      }
-    }
-
-    const wavBlob = audioBufferToWav(buffer);
-    const sampleFile = new File([wavBlob], 'Sample_Testing_Song.wav', { type: 'audio/wav' });
-    handleFileSelect(sampleFile);
-  };
-
-  const checkCredit = async (service, apiKey) => {
+  /* Realtime Credit Verification */
+  const checkCredit = useCallback(async (service, apiKey) => {
     if (!apiKey) return;
-    if (service === 'elevenlabs') {
-      try {
+    try {
+      if (service === 'elevenlabs') {
         const res = await fetch('https://stemsplit-proxy.kitakustik-managemen.workers.dev/elevenlabs/v1/user/subscription', {
           headers: { 'xi-api-key': apiKey }
         });
         if (res.ok) {
           const data = await res.json();
-          const rem = (data.character_limit || 10000) - (data.character_count || 0);
+          const remaining = (data.character_limit || 10000) - (data.character_count || 0);
+          const formatted = `${remaining.toLocaleString()} / ${(data.character_limit || 10000).toLocaleString()} char`;
           setApiKeys(prev => ({
             ...prev,
-            elevenlabs: prev.elevenlabs.map(k => k.key === apiKey ? { ...k, remainingCredit: rem, labelInfo: `${rem} char` } : k)
+            elevenlabs: (prev.elevenlabs || []).map(k => k.key === apiKey ? { ...k, remainingCredit: formatted, lastChecked: new Date().toLocaleTimeString() } : k)
           }));
         }
-      } catch (e) {
-        console.warn('ElevenLabs check credit warning:', e);
-      }
-    } else if (service === 'kieai') {
-      try {
+      } else if (service === 'kieai') {
         const res = await fetch('https://api.kie.ai/api/v1/chat/credit', {
           headers: { 'Authorization': `Bearer ${apiKey}` }
         });
         if (res.ok) {
           const resData = await res.json();
-          const val = typeof resData.data === 'number' ? resData.data : 0;
-          setApiKeys(prev => ({
-            ...prev,
-            kieai: prev.kieai.map(k => k.key === apiKey ? { ...k, remainingCredit: val, labelInfo: `${val} credit` } : k)
-          }));
+          if (resData.code === 200) {
+            const creditNum = Number(resData.data);
+            setApiKeys(prev => ({
+              ...prev,
+              kieai: (prev.kieai || []).map(k => k.key === apiKey ? { ...k, remainingCredit: `${creditNum} Kredit`, lastChecked: new Date().toLocaleTimeString() } : k)
+            }));
+          }
         }
-      } catch (e) {
-        console.warn('Kie.ai check credit warning:', e);
       }
+    } catch (err) {
+      console.warn(`[DEBUG-Credit] Error checking credit for ${service}:`, err);
     }
-  };
+  }, []);
 
   const handleSaveKey = (service) => {
     const val = tempKeyInputs[service]?.trim();
     if (!val) return;
 
-    const newEntry = {
+    const newKeyObj = {
+      id: Date.now().toString(),
       key: val,
-      status: 'active',
-      remainingCredit: 100,
-      labelInfo: 'Tersimpan'
+      label: `Key ${ (apiKeys[service]?.length || 0) + 1 }`,
+      status: 'standby',
+      remainingCredit: null,
+      lastChecked: null
     };
 
     setApiKeys(prev => ({
       ...prev,
-      [service]: [...(prev[service] || []), newEntry]
+      [service]: [...(prev[service] || []), newKeyObj]
     }));
 
     setTempKeyInputs(prev => ({ ...prev, [service]: '' }));
+    addToast('info', 'Key berhasil disimpan!');
     checkCredit(service, val);
-    addToast(`API Key ${service.toUpperCase()} berhasil disimpan!`, 'info');
   };
 
-  const handleDeleteKey = (service, index) => {
+  const handleDeleteKey = (service, keyId) => {
     setApiKeys(prev => ({
       ...prev,
-      [service]: prev[service].filter((_, idx) => idx !== index)
-    }));
-    addToast('API Key dihapus', 'warn');
-  };
-
-  const getNextAvailableKey = (service) => {
-    const list = apiKeys[service] || [];
-    const valid = list.find(k => k.status !== 'failed');
-    return valid ? valid.key : null;
-  };
-
-  const markKeyAsFailed = (service, key) => {
-    setApiKeys(prev => ({
-      ...prev,
-      [service]: prev[service].map(k => k.key === key ? { ...k, status: 'failed', labelInfo: '🔴 Failed' } : k)
+      [service]: (prev[service] || []).filter(k => k.id !== keyId)
     }));
   };
 
+  const handleFileSelect = (file) => {
+    if (!file) return;
+
+    if (!file.type.includes('audio') && !file.name.endsWith('.mp3') && !file.name.endsWith('.wav')) {
+      setUploadError('File harus berformat MP3 atau WAV!');
+      addToast('error', 'Format file tidak didukung!');
+      return;
+    }
+
+    if (file.size > 50 * 1024 * 1024) {
+      setUploadError('Ukuran file melebihi batas maksimal 50MB!');
+      addToast('error', 'Ukuran file terlalu besar!');
+      return;
+    }
+
+    setUploadError(null);
+    setAudioFile(file);
+
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    const newUrl = URL.createObjectURL(file);
+    setAudioUrl(newUrl);
+
+    const tempAudio = new Audio(newUrl);
+    tempAudio.onloadedmetadata = () => {
+      setAudioDuration(tempAudio.duration);
+    };
+
+    addToast('info', `File "${file.name}" berhasil dimuat!`);
+  };
+
+  const generateSampleAudio = () => {
+    const actx = new (window.AudioContext || window.webkitAudioContext)();
+    const sampleRate = actx.sampleRate;
+    const duration = 3;
+    const buffer = actx.createBuffer(1, duration * sampleRate, sampleRate);
+    const data = buffer.getChannelData(0);
+
+    for (let i = 0; i < buffer.length; i++) {
+      data[i] = Math.sin(2 * Math.PI * 440 * (i / sampleRate)) * Math.exp(-3 * (i / (sampleRate * duration)));
+    }
+
+    const wavBlob = bufferToWav(buffer);
+    const file = new File([wavBlob], 'Sample-Audio-Demo.wav', { type: 'audio/wav' });
+    handleFileSelect(file);
+  };
+
+  /* 1. Track Separation Handler */
   const handleStartVocalSeparation = async () => {
-    if (!uploadedFile) return;
+    if (!audioFile) return;
+
     setIsSeparating(true);
-    setSepProgress(10);
-    setSepStatusText('Memulai pemisahan trek...');
+    setSeparationProgress(10);
+    setSeparationStatus('Memulai pemisahan trek...');
     setLocalFallbackInfo(null);
 
+    /* Priority 1: StemSplit.io */
     const stemSplitKey = getNextAvailableKey('stemsplit');
-
     if (stemSplitKey) {
       try {
-        const res = await separateVocalsStemSplit(uploadedFile, stemSplitKey, (prog, txt) => {
-          setSepProgress(prog);
-          setSepStatusText(txt);
+        setVocalSeparationEngine('stemsplit');
+        const res = await separateVocalsStemSplit(audioFile, stemSplitKey.key, (pct, msg) => {
+          setSeparationProgress(pct);
+          setSeparationStatus(msg);
         });
-        setVocalStemBlob(res.vocalBlob);
-        setInstStemBlob(res.instBlob);
-        setVocalStemUrl(res.vocalUrl);
-        setInstStemUrl(res.instUrl);
-        addToast('Pemisahan vokal & instrumen via StemSplit berhasil!', 'info');
+        setOriginalVocalUrl(res.vocalUrl);
+        setOriginalInstrumentalUrl(res.instrumentalUrl);
         setIsSeparating(false);
+        addToast('info', 'Pemisahan trek via StemSplit.io berhasil!');
         return;
-      } catch (e) {
-        console.warn('StemSplit.io error, mencoba fallback:', e);
-        markKeyAsFailed('stemsplit', stemSplitKey);
+      } catch (err) {
+        console.warn('[DEBUG-Separation] StemSplit failed, rotating key/falling back...', err);
+        markKeyAsFailed('stemsplit', stemSplitKey.key);
       }
     }
 
-    setLocalFallbackInfo('ℹ️ Diproses via Engine DSP Lokal (kualitas standar) — API eksternal tidak dapat dijangkau dari sandbox preview ini.');
+    /* Priority 2: Local DSP Fallback */
     try {
-      const localRes = await processLocalAudioSeparation(uploadedFile, (prog, txt) => {
-        setSepProgress(prog);
-        setSepStatusText(txt);
+      setVocalSeparationEngine('local');
+      setLocalFallbackInfo('ℹ️ Diproses via Engine DSP Lokal — API eksternal tidak dapat dijangkau.');
+      const res = await processLocalAudioSeparation(audioFile, (pct, msg) => {
+        setSeparationProgress(pct);
+        setSeparationStatus(msg);
       });
-      setVocalStemBlob(localRes.vocalBlob);
-      setInstStemBlob(localRes.instBlob);
-      setVocalStemUrl(localRes.vocalUrl);
-      setInstStemUrl(localRes.instUrl);
-      addToast('Pemisahan vokal selesai via DSP Lokal', 'warn');
+      setOriginalVocalUrl(res.vocalUrl);
+      setOriginalInstrumentalUrl(res.instrumentalUrl);
+      addToast('warning', 'Diproses via DSP Lokal (Kualitas Standar).');
     } catch (err) {
-      console.error('Fatal DSP Local separation error:', err);
-      addToast('Gagal memisahkan vokal & instrumen!', 'error');
+      console.error('[DEBUG-Separation] Fatal DSP error:', err);
+      addToast('error', 'Gagal memisahkan trek audio!');
     } finally {
       setIsSeparating(false);
     }
   };
 
+  /* 2A. Voice Conversion Handler */
   const handleStartVoiceConversion = async () => {
-    const inputAudio = vocalStemUrl || audioUrl;
-    if (!inputAudio) return;
+    const sourceVocal = originalVocalUrl || audioUrl;
+    if (!sourceVocal) return;
 
     setIsConvertingVoice(true);
-    setVoiceProgress(10);
-    setVoiceStatusText('Memproses karakter vokal...');
+    setVoiceConversionProgress(10);
+    setVoiceConversionStatus('Memulai konversi vokal...');
 
-    if (voiceMode === 'pitch') {
+    if (vocalMode === 'pitch') {
       try {
-        setVoiceProgress(50);
-        setVoiceStatusText('Mengubah pitch vokal di browser...');
-        const res = await convertVoiceLocal(inputAudio, selectedPitchPreset);
-        setConvertedVocalBlob(res.blob);
-        setConvertedVocalUrl(res.url);
-        setVoiceProgress(100);
-        addToast('Konversi pitch vokal selesai!', 'info');
-      } catch (e) {
-        console.warn('Pitch conversion warning:', e);
-        addToast('Gagal mengubah pitch vokal', 'error');
+        const resUrl = await convertVoiceLocal(sourceVocal, pitchPreset, (pct, msg) => {
+          setVoiceConversionProgress(pct);
+          setVoiceConversionStatus(msg);
+        });
+        setConvertedVocalUrl(resUrl);
+        addToast('info', 'Efek Pitch vokal berhasil diterapkan!');
+      } catch (err) {
+        console.warn('[DEBUG-Voice] Local Pitch Error:', err);
+        addToast('error', 'Gagal menerapkan efek pitch vokal.');
       } finally {
         setIsConvertingVoice(false);
       }
       return;
     }
 
-    const elevenKey = getNextAvailableKey('elevenlabs');
-    if (elevenKey && selectedVoiceModel) {
+    /* AI Voice Conversion via ElevenLabs */
+    const elKey = getNextAvailableKey('elevenlabs');
+    if (elKey) {
       try {
-        const res = await convertVoiceElevenLabs(inputAudio, selectedVoiceModel, elevenKey, (prog, txt) => {
-          setVoiceProgress(prog);
-          setVoiceStatusText(txt);
+        const targetVoiceId = aiVoiceModel || '21m00Tcm4TlvDq8ikWAM';
+        const resUrl = await convertVoiceElevenLabs(sourceVocal, targetVoiceId, elKey.key, (pct, msg) => {
+          setVoiceConversionProgress(pct);
+          setVoiceConversionStatus(msg);
         });
-        setConvertedVocalBlob(res.blob);
-        setConvertedVocalUrl(res.url);
-        addToast('Voice conversion ElevenLabs berhasil!', 'info');
+        setConvertedVocalUrl(resUrl);
+        addToast('info', 'Konversi vokal AI ElevenLabs berhasil!');
         setIsConvertingVoice(false);
-        checkCredit('elevenlabs', elevenKey);
         return;
-      } catch (e) {
-        console.warn('ElevenLabs API warning, falling back:', e);
-        markKeyAsFailed('elevenlabs', elevenKey);
+      } catch (err) {
+        console.warn('[DEBUG-Voice] ElevenLabs failed, applying local fallback:', err);
+        markKeyAsFailed('elevenlabs', elKey.key);
       }
     }
 
-    addToast('ℹ️ Provider API menolak permintaan — otomatis memakai Efek Pitch sebagai gantinya.', 'warn');
+    /* Fallback to local pitch */
     try {
-      const res = await convertVoiceLocal(inputAudio, selectedPitchPreset);
-      setConvertedVocalBlob(res.blob);
-      setConvertedVocalUrl(res.url);
-    } catch (e) {
-      console.error('Fatal voice fallback error:', e);
+      addToast('warning', 'Provider API menolak request (butuh langganan) — memakai Efek Pitch.');
+      const resUrl = await convertVoiceLocal(sourceVocal, pitchPreset, (pct, msg) => {
+        setVoiceConversionProgress(pct);
+        setVoiceConversionStatus(msg);
+      });
+      setConvertedVocalUrl(resUrl);
+    } catch (err) {
+      console.error('[DEBUG-Voice] Fatal voice conversion error:', err);
+      addToast('error', 'Gagal memproses vokal.');
     } finally {
       setIsConvertingVoice(false);
     }
   };
 
-  const buildSunoStyleString = () => {
-    const parts = [selectedGenre, selectedMood];
-    if (selectedInstruments && selectedInstruments.length > 0) {
-      parts.push(selectedInstruments.join(', '));
-    }
-    if (selectedTempo === 'slow') parts.push('70 BPM');
-    else if (selectedTempo === 'medium') parts.push('100 BPM');
-    else if (selectedTempo === 'fast') parts.push('130 BPM');
-    else if (selectedTempo === 'very_fast') parts.push('150 BPM');
-    return parts.join(', ').slice(0, 200);
-  };
-
+  /* 2B. Style Adaptation Handler */
   const handleStartStyleRegeneration = async () => {
-    const inputAudio = instStemUrl || audioUrl;
-    if (!inputAudio && genreMode === 'fast') return;
+    const sourceInst = originalInstrumentalUrl || audioUrl;
 
-    setIsGeneratingGenre(true);
-    setGenreProgress(10);
-    setGenreStatusText('Membuat gaya musik baru...');
+    setIsRegeneratingStyle(true);
+    setStyleProgress(10);
+    setStyleStatus('Mempersiapkan gaya instrumen...');
 
-    if (genreMode === 'fast') {
+    if (styleMode === 'fast') {
       try {
-        setGenreProgress(50);
-        setGenreStatusText('Menerapkan EQ & efek genre lokal...');
-        const res = await applyLocalStyleEffect(inputAudio, selectedGenre, selectedMood, selectedTempo);
-        setNewInstBlob(res.blob);
-        setNewInstUrl(res.url);
-        setGenreProgress(100);
-        addToast('Efek gaya musik instan diterapkan!', 'info');
-      } catch (e) {
-        console.warn('Fast genre effect warning:', e);
-        addToast('Gagal menerapkan efek gaya musik', 'error');
+        const resUrl = await applyLocalStyleEffect(sourceInst, fastGenre, fastMood, fastTempo, fastPitch, (pct, msg) => {
+          setStyleProgress(pct);
+          setStyleStatus(msg);
+        });
+        setNewInstrumentalUrl(resUrl);
+        addToast('info', 'Efek Gaya instrumen instan berhasil diterapkan!');
+      } catch (err) {
+        console.warn('[DEBUG-Style] Fast Local Style Error:', err);
+        addToast('error', 'Gagal menerapkan gaya instrumen.');
       } finally {
-        setIsGeneratingGenre(false);
+        setIsRegeneratingStyle(false);
       }
       return;
     }
 
+    /* Mode B: Kie.ai AI Music Generation */
     const kieKey = getNextAvailableKey('kieai');
     if (kieKey) {
       try {
-        const styleStr = buildSunoStyleString();
-        const res = await regenerateInstrumentalApi(customStylePrompt, styleStr, selectedNegativeTags, vocalGender, kieKey, (prog, txt) => {
-          setGenreProgress(prog);
-          setGenreStatusText(txt);
-        });
-        setNewInstBlob(res.blob);
-        setNewInstUrl(res.url);
-        addToast('Regenerasi musik AI Kie.ai berhasil!', 'info');
-        setIsGeneratingGenre(false);
-        checkCredit('kieai', kieKey);
+        const styleString = buildSunoStyleString(aiGenre, aiMood, aiInstruments, aiTempo);
+        const resUrl = await regenerateInstrumentalApi(
+          aiFreePrompt,
+          styleString,
+          aiNegativeTags,
+          aiVocalGender,
+          kieKey.key,
+          (pct, msg) => {
+            setStyleProgress(pct);
+            setStyleStatus(msg);
+          }
+        );
+        setNewInstrumentalUrl(resUrl);
+        addToast('info', 'Musik AI Kie.ai berhasil dibuat!');
+        setIsRegeneratingStyle(false);
         return;
-      } catch (e) {
-        console.warn('Kie.ai API warning, falling back to local effect:', e);
-        markKeyAsFailed('kieai', kieKey);
+      } catch (err) {
+        console.warn('[DEBUG-Style] Kie.ai failed, falling back to local effect:', err);
+        markKeyAsFailed('kieai', kieKey.key);
       }
     }
 
-    addToast('ℹ️ Regenerasi AI tidak dapat dijangkau, memakai Efek Cepat sebagai gantinya.', 'warn');
+    /* Fallback to Fast Local Mode */
     try {
-      const res = await applyLocalStyleEffect(inputAudio, selectedGenre, selectedMood, selectedTempo);
-      setNewInstBlob(res.blob);
-      setNewInstUrl(res.url);
-    } catch (e) {
-      console.error('Fatal style fallback error:', e);
+      addToast('warning', 'Regenerasi AI tidak dapat dijangkau, memakai Efek Cepat.');
+      const resUrl = await applyLocalStyleEffect(sourceInst, fastGenre, fastMood, fastTempo, fastPitch, (pct, msg) => {
+        setStyleProgress(pct);
+        setStyleStatus(msg);
+      });
+      setNewInstrumentalUrl(resUrl);
+    } catch (err) {
+      console.error('[DEBUG-Style] Fatal style regeneration error:', err);
+      addToast('error', 'Gagal memproses gaya instrumen.');
     } finally {
-      setIsGeneratingGenre(false);
+      setIsRegeneratingStyle(false);
     }
   };
 
+  /* 3. Final Audio Mixing Handler */
   const handleStartFinalMixing = async () => {
-    const vAudio = convertedVocalUrl || vocalStemUrl;
-    const iAudio = newInstUrl || instStemUrl;
+    const vocalSource = convertedVocalUrl || originalVocalUrl || audioUrl;
+    const instSource = newInstrumentalUrl || originalInstrumentalUrl || audioUrl;
 
-    if (!vAudio || !iAudio) {
-      addToast('Diperlukan vokal dan instrumen untuk digabungkan!', 'error');
+    if (!vocalSource || !instSource) {
+      addToast('error', 'Membutuhkan trek vokal dan instrumen untuk digabungkan!');
       return;
     }
 
     setIsMixing(true);
     setMixProgress(10);
-    setMixStatusText('Memulai proses mixing audio final...');
+    setMixStatusText('Mulai proses penggabungan cover...');
 
     try {
-      const res = await mixAudioTracks(vAudio, iAudio, (prog, txt) => {
-        setMixProgress(prog);
-        setMixStatusText(txt);
+      const mixedUrl = await mixAudioTracks(vocalSource, instSource, (pct, msg) => {
+        setMixProgress(pct);
+        setMixStatusText(msg);
       });
-      setFinalCoverUrl(res.url);
-      addToast('Hasil Cover Final berhasil dibuat!', 'info');
-    } catch (e) {
-      console.error('Final mixing error:', e);
-      addToast('Gagal menggabungkan audio track!', 'error');
+      setFinalCoverUrl(mixedUrl);
+      addToast('info', 'Cover lagu final siap diunduh!');
+    } catch (err) {
+      console.error('[DEBUG-Mix] Mix Error:', err);
+      addToast('error', 'Gagal menggabungkan audio, coba ulangi tahap sebelumnya.');
     } finally {
       setIsMixing(false);
     }
   };
 
-  const hasVocal = Boolean(convertedVocalUrl || vocalStemUrl);
-  const hasInst = Boolean(newInstUrl || instStemUrl);
-  const canMix = hasVocal && hasInst;
+  /* Generated Suno Style String Preview */
+  const liveStylePreview = useMemo(() => {
+    return buildSunoStyleString(aiGenre, aiMood, aiInstruments, aiTempo);
+  }, [aiGenre, aiMood, aiInstruments, aiTempo]);
 
   return (
-    <div className={`min-h-screen bg-[#0a0118] text-slate-100 font-sans-studio antialiased selection:bg-cyan-500 selection:text-slate-950 transition-opacity duration-700 relative overflow-x-hidden ${loaded ? 'opacity-100' : 'opacity-0'}`}>
-      <style>{fontStyles}</style>
+    <div className={`min-h-screen bg-[#0a0118] text-slate-100 font-sans transition-opacity duration-700 ${loaded ? 'opacity-100' : 'opacity-0'}`}>
+      
+      {/* Background Studio Grid & Waveform Ambient Overlay */}
+      <div className="fixed inset-0 pointer-events-none opacity-5 bg-[radial-gradient(#22d3ee_1px,transparent_1px)] [background-size:24px_24px]" />
 
-      {/* Decorative Waveform & Grid Background Overlay */}
-      <div className="fixed inset-0 pointer-events-none opacity-5 bg-[radial-gradient(#ec4899_1px,transparent_1px),radial-gradient(#22d3ee_1px,transparent_1px)] [background-size:24px_24px] [background-position:0_0,12px_12px]" />
-      <div className="fixed -top-40 -left-40 w-96 h-96 bg-purple-600/20 rounded-full blur-[120px] pointer-events-none" />
-      <div className="fixed -bottom-40 -right-40 w-96 h-96 bg-cyan-600/20 rounded-full blur-[120px] pointer-events-none" />
-
-      {/* Toast Notification Container */}
-      <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-sm w-full">
+      {/* Floating Toast Notification Stack */}
+      <div className="fixed top-5 right-5 z-50 flex flex-col gap-2 max-w-sm w-full">
         {toasts.map(t => (
           <div 
             key={t.id} 
-            className={`p-3 rounded-xl border backdrop-blur-xl shadow-2xl flex items-center justify-between gap-3 text-xs font-mono-studio font-semibold animate-in fade-in slide-in-from-top-2 ${
-              t.type === 'error' ? 'bg-red-950/80 border-red-500/50 text-red-200' :
-              t.type === 'warn' ? 'bg-amber-950/80 border-amber-500/50 text-amber-200' :
+            className={`p-3 rounded-xl border backdrop-blur-md shadow-lg flex items-center justify-between text-sm transition-all ${
+              t.type === 'error' ? 'bg-red-900/80 border-red-500/50 text-red-200' :
+              t.type === 'warning' ? 'bg-amber-900/80 border-amber-500/50 text-amber-200' :
               'bg-cyan-950/80 border-cyan-500/50 text-cyan-200'
             }`}
           >
             <div className="flex items-center gap-2">
-              <AudioWaveform className="w-4 h-4 shrink-0 text-cyan-400" />
-              <span>{t.text}</span>
+              {t.type === 'error' ? <AlertCircle className="w-4 h-4 text-red-400" /> :
+               t.type === 'warning' ? <AlertCircle className="w-4 h-4 text-amber-400" /> :
+               <Info className="w-4 h-4 text-cyan-400" />}
+              <span>{t.message}</span>
             </div>
-            <button onClick={() => removeToast(t.id)} className="p-1 rounded-md hover:bg-slate-800/50">
+            <button onClick={() => removeToast(t.id)} className="text-slate-400 hover:text-white p-1">
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
         ))}
       </div>
 
-      {/* Header */}
-      <header className="sticky top-0 z-40 border-b border-purple-900/30 bg-[#0a0118]/85 backdrop-blur-xl">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between">
+      {/* Header Bar */}
+      <header className="sticky top-0 z-40 backdrop-blur-xl bg-[#0a0118]/80 border-b border-cyan-500/20 px-4 py-3">
+        <div className="max-w-6xl mx-auto flex items-center justify-between">
+          
           <div className="flex items-center gap-3">
-            <div className="relative p-2 rounded-xl bg-gradient-to-tr from-purple-600 via-cyan-500 to-pink-500 shadow-[0_0_20px_rgba(34,211,238,0.3)]">
-              <Disc3 className="w-6 h-6 text-slate-950 animate-spin-slow" />
+            <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-500 to-pink-500 p-0.5 shadow-[0_0_15px_rgba(34,211,238,0.3)]">
+              <div className="w-full h-full bg-slate-950 rounded-[10px] flex items-center justify-center">
+                <AudioWaveform className="w-5 h-5 text-cyan-400 animate-pulse" />
+              </div>
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h1 className="font-sora text-lg sm:text-xl font-black tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-slate-100 via-cyan-200 to-pink-400">
-                  AGE YT#5 Musik Cover
-                </h1>
-                {/* Header Animated EQ Indicator */}
-                <div className="hidden sm:flex items-end gap-0.5 h-4 px-1.5 py-0.5 bg-purple-950/60 rounded border border-purple-500/30">
-                  <span className="w-1 bg-cyan-400 rounded-full animate-eq-1" />
-                  <span className="w-1 bg-pink-400 rounded-full animate-eq-2" />
-                  <span className="w-1 bg-cyan-400 rounded-full animate-eq-3" />
-                  <span className="w-1 bg-pink-400 rounded-full animate-eq-4" />
-                </div>
-              </div>
-              <p className="text-[11px] text-slate-400 font-medium hidden sm:block">
-                AI Audio Creator Studio • Remixer Edition
-              </p>
+              <h1 className="font-display font-bold text-lg md:text-xl tracking-tight bg-gradient-to-r from-cyan-400 via-pink-400 to-purple-400 bg-clip-text text-transparent">
+                AGE YT#5 Musik Cover
+              </h1>
+              <p className="text-xs text-slate-400 font-mono hidden sm:block">AI Music Remixer & Voice Studio</p>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
-            <button
+            <button 
               onClick={() => setShowHelpModal(true)}
-              className="px-3 py-1.5 rounded-lg bg-slate-900/80 border border-slate-800 hover:border-cyan-500/50 text-slate-300 hover:text-cyan-400 transition-all flex items-center gap-1.5 text-xs font-semibold"
+              className="p-2 rounded-xl bg-slate-900/80 border border-slate-700/60 hover:border-cyan-500/50 text-slate-300 hover:text-cyan-400 text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm"
             >
-              <HelpCircle className="w-3.5 h-3.5" />
+              <HelpCircle className="w-4 h-4 text-cyan-400" />
               <span className="hidden sm:inline">Bantuan</span>
             </button>
-            <button
-              onClick={() => setShowApiSettingsModal(true)}
-              className="px-3 py-1.5 rounded-lg bg-slate-900/80 border border-slate-800 hover:border-pink-500/50 text-slate-300 hover:text-pink-400 transition-all flex items-center gap-1.5 text-xs font-semibold"
+
+            <button 
+              onClick={() => setShowApiKeyModal(true)}
+              className="p-2 rounded-xl bg-slate-900/80 border border-slate-700/60 hover:border-pink-500/50 text-slate-300 hover:text-pink-400 text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm"
             >
-              <Settings className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">API Keys</span>
+              <Settings className="w-4 h-4 text-pink-400" />
+              <span className="hidden sm:inline">API Key</span>
             </button>
           </div>
+
         </div>
       </header>
 
-      {/* Main Studio Console Layout */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
-        
-        {/* Panel 1: Upload Lagu Sumber */}
-        <section className="p-4 sm:p-5 rounded-2xl bg-[#0f0b2e]/60 border border-purple-900/40 backdrop-blur-xl shadow-2xl relative overflow-hidden">
+      {/* Main Studio Body */}
+      <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+
+        {}
+        {/* PANEL 1: Upload Lagu */}
+        <section className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 md:p-5 backdrop-blur-xl shadow-xl transition-all hover:border-slate-700">
           <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2.5">
-              <div className="p-1.5 rounded-lg bg-purple-500/10 border border-purple-500/20 text-purple-400">
-                <Upload className="w-4 h-4" />
+            <div className="flex items-center gap-2">
+              <div className="p-2 rounded-lg bg-cyan-500/10 text-cyan-400">
+                <Music className="w-5 h-5" />
               </div>
-              <h2 className="font-sora text-base font-bold text-slate-100">1. Upload Lagu Sumber</h2>
+              <h2 className="font-display font-semibold text-base md:text-lg text-slate-100">1. Upload Lagu Sumber</h2>
             </div>
+            {audioFile && (
+              <span className="text-xs font-mono px-2.5 py-1 rounded-full bg-cyan-950 border border-cyan-500/30 text-cyan-300">
+                {(audioFile.size / (1024 * 1024)).toFixed(2)} MB
+              </span>
+            )}
           </div>
 
-          {!uploadedFile ? (
+          {!audioFile ? (
             <div 
               onClick={() => fileInputRef.current?.click()}
-              className="border border-dashed border-purple-900/60 hover:border-cyan-500/50 rounded-xl p-6 sm:p-8 text-center bg-slate-950/40 hover:bg-slate-900/40 transition-all cursor-pointer group"
+              className="border-2 border-dashed border-slate-700 hover:border-cyan-500/60 rounded-xl p-8 text-center cursor-pointer bg-slate-950/40 hover:bg-slate-900/40 transition-all group"
             >
               <input 
                 type="file" 
                 ref={fileInputRef} 
-                className="hidden" 
-                accept="audio/mp3,audio/wav"
                 onChange={e => handleFileSelect(e.target.files?.[0])}
+                accept="audio/mp3,audio/wav"
+                className="hidden" 
               />
-              <div className="p-3 rounded-full bg-purple-500/10 text-pink-400 w-12 h-12 mx-auto mb-3 flex items-center justify-center group-hover:scale-110 transition-transform shadow-[0_0_15px_rgba(236,72,153,0.2)]">
-                <Music2 className="w-6 h-6" />
+              <Headphones className="w-10 h-10 mx-auto mb-3 text-slate-500 group-hover:text-cyan-400 transition-colors" />
+              <p className="text-sm font-medium text-slate-200">Tarik & Lepas File Audio (.mp3, .wav) di Sini</p>
+              <p className="text-xs text-slate-500 mt-1">Maksimal ukuran file 50MB</p>
+              
+              <div className="mt-4 flex items-center justify-center gap-3">
+                <button type="button" className="px-4 py-2 rounded-xl bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 text-xs font-semibold hover:bg-cyan-500/30 transition-all">
+                  Pilih File Audio
+                </button>
+                <button 
+                  type="button" 
+                  onClick={(e) => { e.stopPropagation(); generateSampleAudio(); }}
+                  className="px-3 py-2 rounded-xl bg-purple-500/20 text-purple-300 border border-purple-500/40 text-xs font-semibold hover:bg-purple-500/30 transition-all flex items-center gap-1.5"
+                >
+                  <Sparkles className="w-3.5 h-3.5" /> 🧪 Tes Lagu Contoh
+                </button>
               </div>
-              <h3 className="font-sora font-bold text-slate-200 text-xs sm:text-sm mb-1">
-                Tarik & Lepas File Audio MP3 / WAV
-              </h3>
-              <p className="text-[11px] text-slate-400 mb-3">Ukuran maksimal file: 50MB</p>
-              <button type="button" className="px-4 py-2 rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-slate-100 font-bold text-xs transition-all shadow-[0_0_15px_rgba(236,72,153,0.3)]">
-                Pilih File Audio
-              </button>
             </div>
           ) : (
-            /* Streamlined Single-Row Audio Header */
-            <div className="p-3 sm:p-4 rounded-xl bg-slate-950/80 border border-slate-800 space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 shrink-0">
-                    <Headphones className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0">
-                    <p className="font-sora font-bold text-xs sm:text-sm text-slate-200 truncate">{uploadedFile.name}</p>
-                    <p className="text-[10px] font-mono-studio text-slate-400">{(uploadedFile.size / (1024 * 1024)).toFixed(2)} MB</p>
+            <div className="bg-slate-950/60 rounded-xl p-4 border border-slate-800 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3 overflow-hidden">
+                  <Disc className="w-8 h-8 text-pink-400 animate-spin-slow flex-shrink-0" />
+                  <div className="truncate">
+                    <p className="text-sm font-semibold text-slate-200 truncate">{audioFile.name}</p>
+                    <p className="text-xs font-mono text-slate-400">Durasi: {Math.floor(audioDuration / 60)}:{(Math.floor(audioDuration % 60)).toString().padStart(2, '0')}s</p>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2 shrink-0">
-                  <button 
-                    onClick={() => fileInputRef.current?.click()}
-                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] font-semibold text-slate-300 flex items-center gap-1 transition-all"
-                  >
-                    <RefreshCw className="w-3 h-3" /> Ganti
-                  </button>
-                  <button 
-                    onClick={() => { setUploadedFile(null); setAudioUrl(null); }}
-                    className="p-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 text-xs transition-all"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                  <input type="file" ref={fileInputRef} className="hidden" accept="audio/mp3,audio/wav" onChange={e => handleFileSelect(e.target.files?.[0])} />
-                </div>
+                <button 
+                  onClick={() => { setAudioFile(null); setAudioUrl(null); }}
+                  className="px-3 py-1.5 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-xs hover:bg-red-500/20 transition-all flex items-center gap-1"
+                >
+                  <Trash2 className="w-3.5 h-3.5" /> Ganti
+                </button>
               </div>
 
-              <audio controls src={audioUrl} className="w-full h-8 rounded-lg" />
+              {audioUrl && (
+                <audio controls src={audioUrl} className="w-full h-9 rounded-lg opacity-90" />
+              )}
             </div>
           )}
 
           {uploadError && (
-            <p className="mt-2.5 text-xs text-red-400 font-semibold flex items-center gap-1.5">
+            <p className="mt-2 text-xs text-red-400 flex items-center gap-1">
               <AlertCircle className="w-3.5 h-3.5" /> {uploadError}
             </p>
           )}
-
-          <div className="mt-2.5 flex justify-end">
-            <button 
-              onClick={handleLoadSampleSong}
-              className="text-[11px] font-mono-studio text-slate-400 hover:text-cyan-400 flex items-center gap-1 transition-colors"
-            >
-              🧪 Tes dengan lagu contoh (4s)
-            </button>
-          </div>
         </section>
 
-        {/* Panel 2: Pemisahan Trek & Pengaturan Vokal/Gaya */}
-        <div className="space-y-6">
+        {}
+        {/* PANEL 2: Pemisahan Trek & Pengaturan */}
+        <section className={`bg-slate-900/60 border border-slate-800 rounded-2xl p-4 md:p-5 backdrop-blur-xl shadow-xl transition-all ${!audioFile ? 'opacity-50 pointer-events-none' : ''}`}>
           
-          {/* Section 2-Top: Langkah Awal: Pisahkan Trek */}
-          <section className="p-4 sm:p-5 rounded-2xl bg-[#0f0b2e]/60 border border-purple-900/40 backdrop-blur-xl shadow-2xl space-y-4">
-            <div className="flex items-center gap-2.5">
-              <div className="p-1.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-cyan-400">
-                <Layers className="w-4 h-4" />
-              </div>
-              <div>
-                <h2 className="font-sora text-base font-bold text-slate-100">2. Langkah Awal: Pisahkan Trek</h2>
-                <p className="text-[11px] text-slate-400">Pisahkan file vokal dan instrumen sebelum mengubah karakter suara & gaya musik</p>
-              </div>
+          <div className="flex items-center gap-2 mb-4">
+            <div className="p-2 rounded-lg bg-pink-500/10 text-pink-400">
+              <SlidersHorizontal className="w-5 h-5" />
+            </div>
+            <h2 className="font-display font-semibold text-base md:text-lg text-slate-100">2. Pemisahan Trek & Pengaturan Suara</h2>
+          </div>
+
+          {/* Step 2A: Pemisahan Trek */}
+          <div className="bg-slate-950/40 border border-slate-800 rounded-xl p-4 mb-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-cyan-300 flex items-center gap-2">
+                <AudioWaveform className="w-4 h-4" /> Langkah Awal: Pisahkan Trek Audio
+              </h3>
+              {vocalSeparationEngine === 'local' && (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-950 border border-amber-500/30 text-amber-300">
+                  DSP Lokal Active
+                </span>
+              )}
             </div>
 
-            <button 
+            <button
               onClick={handleStartVocalSeparation}
-              disabled={!uploadedFile || isSeparating}
-              className={`w-full py-3 rounded-xl font-sora font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all ${
-                !uploadedFile || isSeparating 
-                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                  : 'bg-gradient-to-r from-cyan-500 via-blue-600 to-purple-600 text-slate-950 font-black shadow-[0_0_20px_rgba(34,211,238,0.3)] hover:brightness-110'
-              }`}
+              disabled={isSeparating || !audioFile}
+              className="w-full py-3 px-4 rounded-xl font-semibold text-sm bg-gradient-to-r from-cyan-500 to-pink-500 hover:from-cyan-400 hover:to-pink-400 text-slate-950 shadow-[0_0_20px_rgba(34,211,238,0.25)] transition-all flex items-center justify-center gap-2 disabled:opacity-50"
             >
-              {isSeparating ? <RefreshCw className="w-4 h-4 animate-spin text-slate-950" /> : <Layers className="w-4 h-4 text-slate-950" />}
-              <span>{isSeparating ? sepStatusText : 'Pisahkan Vokal & Instrumen (StemSplit)'}</span>
+              {isSeparating ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin" /> {separationStatus} ({separationProgress}%)
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4" /> Pisahkan Vokal & Instrumen
+                </>
+              )}
             </button>
 
-            <div className="p-3 rounded-xl bg-blue-950/40 border border-blue-500/30 text-blue-200/90 text-xs flex items-start gap-2">
-              <span className="text-sm leading-none">💡</span>
-              <p className="leading-relaxed text-[11px]">
-                <strong className="font-semibold text-blue-100">Kenapa harus dipisah dulu?</strong> Lagu asli Anda berisi vokal dan instrumental yang menyatu. Supaya cover akhir bersih, sistem memisahkan vokal dari musik asli untuk memproses vokal dan instrumen baru secara terisolasi.
+            {/* Explanatory Info Box */}
+            <div className="p-3 rounded-lg bg-cyan-950/30 border border-cyan-500/20 text-xs text-cyan-200/80 flex items-start gap-2">
+              <Info className="w-4 h-4 text-cyan-400 flex-shrink-0 mt-0.5" />
+              <p>
+                <strong>Kenapa harus dipisah dulu?</strong> Lagu asli Anda berisi vokal dan instrumen yang menyatu. Supaya cover akhir bersih, vokal perlu dicabut dari lagu asli.
               </p>
             </div>
 
-            {localFallbackInfo && (
-              <div className="p-2.5 rounded-xl bg-slate-950 border border-amber-500/30 text-amber-300 text-xs font-mono-studio">
-                {localFallbackInfo}
+            {/* Audio Stem Players */}
+            {(originalVocalUrl || originalInstrumentalUrl) && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2">
+                <div className="bg-slate-900/80 p-3 rounded-lg border border-slate-800">
+                  <p className="text-xs font-semibold text-cyan-300 mb-2 flex items-center gap-1.5">
+                    <Mic className="w-3.5 h-3.5" /> Vokal Asli Saja
+                  </p>
+                  <audio controls src={originalVocalUrl} className="w-full h-8" />
+                </div>
+
+                <div className="bg-slate-900/80 p-3 rounded-lg border border-slate-800">
+                  <p className="text-xs font-semibold text-pink-300 mb-2 flex items-center gap-1.5">
+                    <Radio className="w-3.5 h-3.5" /> Instrumental Asli Saja
+                  </p>
+                  <audio controls src={originalInstrumentalUrl} className="w-full h-8" />
+                </div>
               </div>
             )}
+          </div>
 
-            {/* Stem Players */}
-            {(vocalStemUrl || instStemUrl) && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-3 border-t border-purple-900/30 animate-in fade-in slide-in-from-top-2">
-                {vocalStemUrl && (
-                  <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1.5">
-                    <p className="text-[11px] font-sora font-bold text-pink-400 flex items-center gap-1.5">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> 🎤 Vokal Asli (Stem)
-                    </p>
-                    <audio controls src={vocalStemUrl} className="w-full h-8" />
-                  </div>
-                )}
-                {instStemUrl && (
-                  <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1.5">
-                    <p className="text-[11px] font-sora font-bold text-cyan-400 flex items-center gap-1.5">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> 🎸 Instrumen Asli (Stem)
-                    </p>
-                    <audio controls src={instStemUrl} className="w-full h-8" />
-                  </div>
-                )}
-              </div>
-            )}
-          </section>
-
-          {/* Grid 2A & 2B */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Sub-panels 2A & 2B */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
             
             {/* Panel 2A: Ubah Karakter Vokal */}
-            <section className="p-4 sm:p-5 rounded-2xl bg-[#0f0b2e]/60 border border-purple-900/40 backdrop-blur-xl shadow-2xl flex flex-col justify-between space-y-5">
-              <div>
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-2">
-                    <div className="p-1.5 rounded-lg bg-pink-500/10 border border-pink-500/20 text-pink-400">
-                      <Wand2 className="w-4 h-4" />
-                    </div>
-                    <h2 className="font-sora text-sm sm:text-base font-bold text-slate-100">2A. Ubah Karakter Vokal</h2>
-                  </div>
+            <div className="bg-slate-950/40 border border-slate-800 rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+                <h3 className="text-sm font-semibold text-slate-200 flex items-center gap-1.5">
+                  <Mic className="w-4 h-4 text-cyan-400" /> 2A. Ubah Karakter Vokal
+                </h3>
 
-                  <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 text-[11px] font-semibold">
-                    <button 
-                      onClick={() => setVoiceMode('pitch')}
-                      className={`px-2.5 py-1 rounded-md transition-all ${voiceMode === 'pitch' ? 'bg-pink-600 text-slate-100' : 'text-slate-400 hover:text-slate-200'}`}
-                    >
-                      🎚️ Pitch (Gratis)
-                    </button>
-                    <button 
-                      onClick={() => setVoiceMode('ai')}
-                      className={`px-2.5 py-1 rounded-md transition-all ${voiceMode === 'ai' ? 'bg-pink-600 text-slate-100' : 'text-slate-400 hover:text-slate-200'}`}
-                    >
-                      ✨ AI Voice
-                    </button>
-                  </div>
+                {/* Mode Toggle */}
+                <div className="flex bg-slate-900 p-0.5 rounded-lg border border-slate-800 text-[11px]">
+                  <button 
+                    onClick={() => setVocalMode('pitch')}
+                    className={`px-2.5 py-1 rounded-md transition-all ${vocalMode === 'pitch' ? 'bg-cyan-500 text-slate-950 font-semibold' : 'text-slate-400'}`}
+                  >
+                    🎚️ Pitch (Gratis)
+                  </button>
+                  <button 
+                    onClick={() => setVocalMode('aivoice')}
+                    className={`px-2.5 py-1 rounded-md transition-all ${vocalMode === 'aivoice' ? 'bg-pink-500 text-slate-950 font-semibold' : 'text-slate-400'}`}
+                  >
+                    ✨ AI Voice
+                  </button>
                 </div>
-
-                {voiceMode === 'pitch' ? (
-                  <div className="space-y-3">
-                    <label className="block text-xs font-semibold text-slate-300">Preset Pitch Vokal</label>
-                    <select 
-                      value={selectedPitchPreset}
-                      onChange={e => setSelectedPitchPreset(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200 focus:border-pink-500 outline-none"
-                    >
-                      <option value="up_light">Pitch Naik (Ringan)</option>
-                      <option value="down_light">Pitch Turun (Ringan)</option>
-                      <option value="chipmunk">Nada Tinggi (Chipmunk)</option>
-                      <option value="deep">Nada Rendah (Berat)</option>
-                      <option value="robotic">Robotik / Metallic</option>
-                    </select>
-                    <p className="text-[10px] text-slate-400">💡 Mengubah nada vokal secara instan di browser tanpa kuota API.</p>
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    <div className="p-2.5 rounded-xl bg-amber-950/40 border border-amber-500/30 text-amber-200 text-xs">
-                      ⚠️ Membutuhkan API Key ElevenLabs / Kits.AI valid pada Pengaturan.
-                    </div>
-                    <label className="block text-xs font-semibold text-slate-300">ElevenLabs Voice ID</label>
-                    <input 
-                      type="text"
-                      placeholder="Masukkan Voice ID"
-                      value={selectedVoiceModel}
-                      onChange={e => setSelectedVoiceModel(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200 font-mono-studio focus:border-pink-500 outline-none"
-                    />
-                  </div>
-                )}
               </div>
 
-              <div className="space-y-3 pt-3 border-t border-purple-900/30">
-                <button 
-                  onClick={handleStartVoiceConversion}
-                  disabled={isConvertingVoice || (!vocalStemUrl && !audioUrl)}
-                  className={`w-full py-3 rounded-xl font-sora font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all ${
-                    isConvertingVoice || (!vocalStemUrl && !audioUrl)
-                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                      : 'bg-gradient-to-r from-pink-500 to-purple-600 text-slate-100 shadow-[0_0_15px_rgba(236,72,153,0.3)] hover:brightness-110'
-                  }`}
-                >
-                  {isConvertingVoice ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                  <span>{isConvertingVoice ? voiceStatusText : 'Proses Ubah Vokal'}</span>
-                </button>
-
-                {convertedVocalUrl && (
-                  <div className="p-3 rounded-xl bg-slate-950/80 border border-pink-500/30 space-y-1.5">
-                    <p className="text-[11px] font-sora font-bold text-pink-400 flex items-center gap-1.5">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> Vokal Baru Siap
-                    </p>
-                    <audio controls src={convertedVocalUrl} className="w-full h-8 rounded-lg" />
+              {vocalMode === 'pitch' ? (
+                <div className="space-y-3">
+                  <label className="text-xs text-slate-300 block">Pilihan Preset Pitch:</label>
+                  <select 
+                    value={pitchPreset} 
+                    onChange={e => setPitchPreset(e.target.value)}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-slate-200 focus:border-cyan-500 focus:outline-none"
+                  >
+                    <option value="up">Pitch Naik (Ringan)</option>
+                    <option value="down">Pitch Turun (Ringan)</option>
+                    <option value="chipmunk">Nada Tinggi (Chipmunk)</option>
+                    <option value="deep">Nada Rendah (Berat)</option>
+                    <option value="robot">Robotik / Netral</option>
+                  </select>
+                  <p className="text-[11px] text-slate-500">
+                    Mode ini mengubah pitch vokal instan di browser tanpa memerlukan API key.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="p-2.5 rounded-lg bg-amber-950/30 border border-amber-500/20 text-[11px] text-amber-200/80">
+                    ⚠️ Fitur AI Voice membutuhkan API Key ElevenLabs / Kits.AI yang valid.
                   </div>
-                )}
-              </div>
-            </section>
+
+                  <label className="text-xs text-slate-300 block">Pilih Model Suara AI:</label>
+                  <select 
+                    value={aiVoiceModel} 
+                    onChange={e => setAiVoiceModel(e.target.value)}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-slate-200 focus:border-pink-500 focus:outline-none"
+                  >
+                    {aiVoiceList.map(v => (
+                      <option key={v.voice_id} value={v.voice_id}>{v.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              <button
+                onClick={handleStartVoiceConversion}
+                disabled={isConvertingVoice || (!originalVocalUrl && !audioUrl)}
+                className="w-full py-2.5 rounded-lg text-xs font-semibold bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/30 transition-all flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                {isConvertingVoice ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                Proses Ubah Vokal
+              </button>
+
+              {convertedVocalUrl && (
+                <div className="pt-2">
+                  <p className="text-xs font-semibold text-cyan-300 mb-1">Vokal Baru (Hasil Modifikasi):</p>
+                  <audio controls src={convertedVocalUrl} className="w-full h-8" />
+                </div>
+              )}
+            </div>
 
             {/* Panel 2B: Ubah Gaya Musik */}
-            <section className="p-4 sm:p-5 rounded-2xl bg-[#0f0b2e]/60 border border-purple-900/40 backdrop-blur-xl shadow-2xl flex flex-col justify-between space-y-5">
-              <div>
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-2">
-                    <div className="p-1.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-cyan-400">
-                      <SlidersHorizontal className="w-4 h-4" />
-                    </div>
-                    <h2 className="font-sora text-sm sm:text-base font-bold text-slate-100">2B. Ubah Gaya Musik</h2>
-                  </div>
+            <div className="bg-slate-950/40 border border-slate-800 rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+                <h3 className="text-sm font-semibold text-slate-200 flex items-center gap-1.5">
+                  <Radio className="w-4 h-4 text-pink-400" /> 2B. Ubah Gaya Musik
+                </h3>
 
-                  <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 text-[11px] font-semibold">
-                    <button 
-                      onClick={() => setGenreMode('fast')}
-                      className={`px-2.5 py-1 rounded-md transition-all ${genreMode === 'fast' ? 'bg-cyan-600 text-slate-100' : 'text-slate-400 hover:text-slate-200'}`}
-                    >
-                      ⚡ Efek Cepat
-                    </button>
-                    <button 
-                      onClick={() => setGenreMode('ai')}
-                      className={`px-2.5 py-1 rounded-md transition-all ${genreMode === 'ai' ? 'bg-cyan-600 text-slate-100' : 'text-slate-400 hover:text-slate-200'}`}
-                    >
-                      🤖 AI (Kie.ai)
-                    </button>
+                <div className="flex bg-slate-900 p-0.5 rounded-lg border border-slate-800 text-[11px]">
+                  <button 
+                    onClick={() => setStyleMode('fast')}
+                    className={`px-2.5 py-1 rounded-md transition-all ${styleMode === 'fast' ? 'bg-cyan-500 text-slate-950 font-semibold' : 'text-slate-400'}`}
+                  >
+                    ⚡ Gratis
+                  </button>
+                  <button 
+                    onClick={() => setStyleMode('ai')}
+                    className={`px-2.5 py-1 rounded-md transition-all ${styleMode === 'ai' ? 'bg-pink-500 text-slate-950 font-semibold' : 'text-slate-400'}`}
+                  >
+                    🤖 AI Kie.ai
+                  </button>
+                </div>
+              </div>
+
+              {styleMode === 'fast' ? (
+                <div className="space-y-3">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-[11px] text-slate-400">Genre:</label>
+                      <select 
+                        value={fastGenre} 
+                        onChange={e => setFastGenre(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-slate-200"
+                      >
+                        <option value="lofi">Lo-Fi</option>
+                        <option value="edm">EDM</option>
+                        <option value="acoustic">Acoustic</option>
+                        <option value="cyberpunk">Cyberpunk</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] text-slate-400">Pitch Shift:</label>
+                      <input 
+                        type="range" min="0" max="100" value={fastPitch} 
+                        onChange={e => setFastPitch(Number(e.target.value))}
+                        className="w-full accent-cyan-400" 
+                      />
+                    </div>
                   </div>
                 </div>
-
-                {genreMode === 'fast' ? (
-                  <div className="grid grid-cols-2 gap-2.5 text-xs">
+              ) : (
+                <div className="space-y-3 text-xs">
+                  <div className="grid grid-cols-2 gap-2">
                     <div>
-                      <label className="block mb-1 font-semibold text-slate-400">Genre</label>
-                      <select value={selectedGenre} onChange={e => setSelectedGenre(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-slate-200 focus:border-cyan-500 outline-none">
-                        {['Lo-Fi', 'EDM', 'Acoustic', 'Cyberpunk', 'Pop', 'Rock', 'Jazz'].map(g => (
+                      <label className="text-slate-400 block mb-1">Genre:</label>
+                      <select value={aiGenre} onChange={e => setAiGenre(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-slate-200">
+                        {['Pop', 'Rock', 'Jazz', 'Hip-Hop', 'Electronic/EDM', 'Classical', 'Lo-Fi', 'Acoustic', 'R&B'].map(g => (
                           <option key={g} value={g}>{g}</option>
                         ))}
                       </select>
                     </div>
+
                     <div>
-                      <label className="block mb-1 font-semibold text-slate-400">Tempo</label>
-                      <select value={selectedTempo} onChange={e => setSelectedTempo(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-slate-200 focus:border-cyan-500 outline-none">
-                        <option value="slow">Lambat (80 BPM)</option>
-                        <option value="medium">Sedang (100 BPM)</option>
-                        <option value="fast">Cepat (130 BPM)</option>
+                      <label className="text-slate-400 block mb-1">Mood:</label>
+                      <select value={aiMood} onChange={e => setAiMood(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-slate-200">
+                        {['Calm', 'Energetic', 'Happy', 'Sad', 'Dreamy', 'Dark', 'Epic'].map(m => (
+                          <option key={m} value={m}>{m}</option>
+                        ))}
                       </select>
                     </div>
                   </div>
-                ) : (
-                  <div className="space-y-3 text-xs">
-                    {/* Grid Dropdowns: Genre, Mood, Preferensi Vokal, Tempo */}
-                    <div className="grid grid-cols-2 gap-2.5">
-                      <div>
-                        <label className="block mb-1 font-semibold text-slate-300 text-[11px]">Genre Musik</label>
-                        <select 
-                          value={selectedGenre} 
-                          onChange={e => setSelectedGenre(e.target.value)} 
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-xs text-slate-200 focus:border-cyan-500 outline-none"
-                        >
-                          {['Pop', 'Rock', 'Jazz', 'Hip-Hop', 'Electronic/EDM', 'Classical', 'Lo-Fi', 'Acoustic', 'R&B', 'Country', 'Reggae', 'Funk', 'Ambient'].map(g => (
-                            <option key={g} value={g}>{g}</option>
-                          ))}
-                        </select>
-                      </div>
 
-                      <div>
-                        <label className="block mb-1 font-semibold text-slate-300 text-[11px]">Mood / Suasana</label>
-                        <select 
-                          value={selectedMood} 
-                          onChange={e => setSelectedMood(e.target.value)} 
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-xs text-slate-200 focus:border-cyan-500 outline-none"
-                        >
-                          {['Calm', 'Energetic', 'Happy', 'Sad', 'Dreamy', 'Dark', 'Uplifting', 'Nostalgic', 'Romantic', 'Epic'].map(m => (
-                            <option key={m} value={m}>{m}</option>
-                          ))}
-                        </select>
-                      </div>
-
-                      <div>
-                        <label className="block mb-1 font-semibold text-slate-300 text-[11px]">Preferensi Vokal</label>
-                        <select 
-                          value={vocalGender} 
-                          onChange={e => setVocalGender(e.target.value)} 
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-xs text-slate-200 focus:border-cyan-500 outline-none"
-                        >
-                          <option value="none">Tanpa Preferensi</option>
-                          <option value="m">Vokal Pria</option>
-                          <option value="f">Vokal Wanita</option>
-                        </select>
-                      </div>
-
-                      <div>
-                        <label className="block mb-1 font-semibold text-slate-300 text-[11px]">Tempo Lagu</label>
-                        <select 
-                          value={selectedTempo} 
-                          onChange={e => setSelectedTempo(e.target.value)} 
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-xs text-slate-200 focus:border-cyan-500 outline-none"
-                        >
-                          <option value="slow">Lambat (60-80 BPM)</option>
-                          <option value="medium">Sedang (90-110 BPM)</option>
-                          <option value="fast">Cepat (120-140 BPM)</option>
-                          <option value="very_fast">Sangat Cepat (150+ BPM)</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    {/* Multi-select Chips: Instrumen Utama (max 3) */}
-                    <div>
-                      <div className="flex items-center justify-between mb-1.5">
-                        <label className="font-semibold text-slate-300 text-[11px]">Instrumen Utama (Maks. 3)</label>
-                        <span className="text-[10px] text-slate-400 font-mono-studio">{selectedInstruments.length}/3 dipilih</span>
-                      </div>
-                      <div className="flex flex-wrap gap-1.5">
-                        {['Piano', 'Acoustic Guitar', 'Electric Guitar', 'Synth', 'Strings', 'Saxophone', 'Violin', 'Drums', 'Bass', 'Flute'].map(inst => {
-                          const isSelected = selectedInstruments.includes(inst);
-                          return (
-                            <button
-                              key={inst}
-                              type="button"
-                              onClick={() => {
-                                if (isSelected) {
-                                  setSelectedInstruments(prev => prev.filter(i => i !== inst));
-                                } else if (selectedInstruments.length < 3) {
-                                  setSelectedInstruments(prev => [...prev, inst]);
-                                }
-                              }}
-                              className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition-all border ${
-                                isSelected 
-                                  ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-[0_0_8px_rgba(34,211,238,0.3)]' 
-                                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-                              }`}
-                            >
-                              {isSelected ? '✓ ' : '+ '}{inst}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Multi-select Chips: Hindari / Negative Tags */}
-                    <div>
-                      <label className="block mb-1.5 font-semibold text-slate-300 text-[11px]">Hindari (Negative Tags - Opsional)</label>
-                      <div className="flex flex-wrap gap-1.5">
-                        {['Heavy Metal', 'Distorsi Berat', 'Vokal Berteriak', 'Genre Anak-anak'].map(tag => {
-                          const isSelected = selectedNegativeTags.includes(tag);
-                          return (
-                            <button
-                              key={tag}
-                              type="button"
-                              onClick={() => {
-                                if (isSelected) {
-                                  setSelectedNegativeTags(prev => prev.filter(t => t !== tag));
-                                } else {
-                                  setSelectedNegativeTags(prev => [...prev, tag]);
-                                }
-                              }}
-                              className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition-all border ${
-                                isSelected 
-                                  ? 'bg-red-500/20 border-red-400 text-red-300 shadow-[0_0_8px_rgba(239,68,68,0.3)]' 
-                                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-                              }`}
-                            >
-                              {isSelected ? '✕ ' : '+ '}{tag}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Free-text prompt input (Optional supplement) */}
-                    <div>
-                      <label className="block mb-1 font-semibold text-slate-300 text-[11px]">
-                        Deskripsi Tambahan / Detail Gaya (Opsional)
-                      </label>
-                      <input 
-                        type="text"
-                        placeholder="misal: Solo saxophone lembut di tengah lagu"
-                        value={customStylePrompt}
-                        onChange={e => setCustomStylePrompt(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200 focus:border-cyan-500 outline-none"
-                      />
-                    </div>
-
-                    {/* Live Style Preview */}
-                    <div className="p-2 rounded-lg bg-slate-950/80 border border-cyan-500/20 text-[10px] font-mono-studio text-cyan-300 flex items-start gap-1.5">
-                      <Sparkles className="w-3.5 h-3.5 text-cyan-400 shrink-0 mt-0.5" />
-                      <div>
-                        <span className="font-bold text-slate-300">Preview Gaya: </span>
-                        <span>{buildSunoStyleString()}</span>
-                      </div>
-                    </div>
-
-                    <p className="text-[10px] text-amber-300/80 italic leading-relaxed">
-                      ℹ️ Mode ini menghasilkan instrumental baru dari deskripsi pilihan & teks di atas, bukan mengubah instrumental asli lagu Anda. Vokal hasil pisahan tetap dipakai nanti di tahap akhir untuk digabung dengan instrumental baru ini.
-                    </p>
+                  <div>
+                    <label className="text-slate-400 block mb-1">Deskripsi Tambahan (Prompt):</label>
+                    <textarea 
+                      value={aiFreePrompt} 
+                      onChange={e => setAiFreePrompt(e.target.value)}
+                      placeholder="e.g. Acoustic guitar cover with soft drum brush..."
+                      className="w-full h-14 bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-slate-200 focus:outline-none focus:border-pink-500"
+                    />
                   </div>
-                )}
-              </div>
 
-              <div className="space-y-3 pt-3 border-t border-purple-900/30">
-                <button 
-                  onClick={handleStartStyleRegeneration}
-                  disabled={isGeneratingGenre || (!instStemUrl && !audioUrl)}
-                  className={`w-full py-3 rounded-xl font-sora font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all ${
-                    isGeneratingGenre || (!instStemUrl && !audioUrl)
-                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                      : 'bg-gradient-to-r from-cyan-400 to-blue-500 text-slate-950 font-black shadow-[0_0_15px_rgba(34,211,238,0.3)] hover:brightness-110'
-                  }`}
-                >
-                  {isGeneratingGenre ? <RefreshCw className="w-4 h-4 animate-spin text-slate-950" /> : <Sparkles className="w-4 h-4 text-slate-950" />}
-                  <span>{isGeneratingGenre ? genreStatusText : 'Proses Ubah Gaya'}</span>
-                </button>
-
-                {newInstUrl && (
-                  <div className="p-3 rounded-xl bg-slate-950/80 border border-cyan-500/30 space-y-1.5">
-                    <p className="text-[11px] font-sora font-bold text-cyan-400 flex items-center gap-1.5">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> Instrumen Baru Siap
-                    </p>
-                    <audio controls src={newInstUrl} className="w-full h-8 rounded-lg" />
+                  <div className="p-2 rounded bg-slate-900 border border-slate-800 text-[10px] font-mono text-cyan-300">
+                    Preview: {liveStylePreview}
                   </div>
-                )}
-              </div>
-            </section>
-          </div>
-
-        </div>
-
-        {/* Panel 3: Mix & Hasil Cover Final */}
-        <section className="p-4 sm:p-5 rounded-2xl bg-[#0f0b2e]/60 border border-purple-900/40 backdrop-blur-xl shadow-2xl space-y-4">
-          <div className="flex items-center gap-2.5">
-            <div className="p-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
-              <Activity className="w-4 h-4" />
-            </div>
-            <div>
-              <h2 className="font-sora text-base font-bold text-slate-100">3. Mix & Hasil Cover Final</h2>
-              <p className="text-[11px] text-slate-400">Gabungkan track vokal dan instrumen untuk mendownload lagu cover final</p>
-            </div>
-          </div>
-
-          {/* Compact Pipeline Status Bar */}
-          <div className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 flex flex-wrap items-center justify-center gap-1.5 text-[11px] font-mono-studio text-slate-300 text-center">
-            <span className={uploadedFile ? 'text-emerald-400 font-bold' : 'text-slate-500'}>1. Upload</span>
-            <ChevronRight className="w-3 h-3 text-slate-600" />
-            <span className={(vocalStemUrl || instStemUrl) ? 'text-emerald-400 font-bold' : 'text-slate-500'}>2. Pisah Trek</span>
-            <ChevronRight className="w-3 h-3 text-slate-600" />
-            <span className={(convertedVocalUrl || newInstUrl) ? 'text-emerald-400 font-bold' : 'text-slate-400'}>3. Vokal & Gaya</span>
-            <ChevronRight className="w-3 h-3 text-slate-600" />
-            <span className={finalCoverUrl ? 'text-emerald-400 font-bold' : 'text-slate-500'}>4. Mix Cover</span>
-          </div>
-
-          <div className="space-y-2">
-            <button 
-              onClick={handleStartFinalMixing}
-              disabled={!canMix || isMixing}
-              className={`w-full py-3.5 rounded-xl font-sora font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all ${
-                !canMix || isMixing
-                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                  : 'bg-gradient-to-r from-emerald-400 via-cyan-400 to-pink-500 text-slate-950 font-black shadow-[0_0_20px_rgba(16,185,129,0.3)] hover:brightness-110'
-              }`}
-            >
-              {isMixing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4 text-slate-950" />}
-              <span>{isMixing ? mixStatusText : 'Gabungkan & Buat Cover Final'}</span>
-            </button>
-            <p className="text-[10px] text-slate-400 text-center">
-              💡 Bagian yang belum diproses akan memakai versi asli lagu Anda secara otomatis.
-            </p>
-          </div>
-
-          {/* Final Result Player */}
-          {finalCoverUrl && (
-            <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-r from-emerald-950/60 via-slate-950 to-cyan-950/60 border border-emerald-500/40 space-y-3 animate-in fade-in slide-in-from-bottom-2">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <AudioLines className="w-5 h-5 text-emerald-400" />
-                  <h3 className="font-sora font-extrabold text-xs sm:text-sm text-emerald-200">Hasil Cover Lagu Final</h3>
                 </div>
+              )}
+
+              <button
+                onClick={handleStartStyleRegeneration}
+                disabled={isRegeneratingStyle || (!originalInstrumentalUrl && !audioUrl)}
+                className="w-full py-2.5 rounded-lg text-xs font-semibold bg-pink-500/20 border border-pink-500/40 text-pink-300 hover:bg-pink-500/30 transition-all flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                {isRegeneratingStyle ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                Proses Ubah Gaya
+              </button>
+
+              {newInstrumentalUrl && (
+                <div className="pt-2">
+                  <p className="text-xs font-semibold text-pink-300 mb-1">Instrumental Baru:</p>
+                  <audio controls src={newInstrumentalUrl} className="w-full h-8" />
+                </div>
+              )}
+            </div>
+
+          </div>
+        </section>
+
+        {}
+        {/* PANEL 3: Mix & Hasil Cover Final */}
+        <section className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 md:p-5 backdrop-blur-xl shadow-xl transition-all">
+          <div className="flex items-center gap-2 mb-4">
+            <div className="p-2 rounded-lg bg-purple-500/10 text-purple-400">
+              <Disc className="w-5 h-5" />
+            </div>
+            <h2 className="font-display font-semibold text-base md:text-lg text-slate-100">3. Mix & Hasil Cover Final</h2>
+          </div>
+
+          {/* Pipeline Tracker Indicator */}
+          <div className="flex items-center justify-between bg-slate-950/60 p-3 rounded-xl border border-slate-800 mb-4 text-xs font-mono">
+            <span className={audioFile ? 'text-cyan-400' : 'text-slate-600'}>1. Upload</span>
+            <span className="text-slate-600">→</span>
+            <span className={originalVocalUrl ? 'text-cyan-400' : 'text-slate-600'}>2. Pisah Trek</span>
+            <span className="text-slate-600">→</span>
+            <span className={convertedVocalUrl || newInstrumentalUrl ? 'text-pink-400' : 'text-slate-600'}>3. Vokal & Gaya</span>
+            <span className="text-slate-600">→</span>
+            <span className={finalCoverUrl ? 'text-emerald-400' : 'text-slate-600'}>4. Mix Cover</span>
+          </div>
+
+          <button
+            onClick={handleStartFinalMixing}
+            disabled={isMixing || (!originalVocalUrl && !convertedVocalUrl && !audioUrl)}
+            className="w-full py-3.5 px-4 rounded-xl font-bold text-sm bg-gradient-to-r from-cyan-500 via-purple-500 to-pink-500 hover:opacity-90 text-slate-950 shadow-[0_0_25px_rgba(236,72,153,0.3)] transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+          >
+            {isMixing ? (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin" /> {mixStatusText} ({mixProgress}%)
+              </>
+            ) : (
+              <>
+                <Music2 className="w-4 h-4" /> Gabungkan & Buat Cover Final
+              </>
+            )}
+          </button>
+
+          <p className="text-[11px] text-slate-500 text-center mt-2">
+            Bagian yang belum diproses akan memakai versi asli lagu Anda secara otomatis.
+          </p>
+
+          {/* Final Cover Output Player & Download Button */}
+          {finalCoverUrl && (
+            <div className="mt-5 p-4 rounded-xl bg-gradient-to-r from-cyan-950/40 to-pink-950/40 border border-cyan-500/40 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-cyan-300 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" /> Hasil Cover Lagu Anda (.WAV)
+                </span>
+                
                 <a 
                   href={finalCoverUrl} 
-                  download={`AGE-YT5-Cover-${uploadedFile ? uploadedFile.name.replace(/\.[^/.]+$/, '') : 'Song'}.wav`}
-                  className="px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-sora font-black text-xs flex items-center gap-1.5 shadow-[0_0_15px_rgba(16,185,129,0.4)] transition-all"
+                  download={`AGE-YT5-Cover-${audioFile?.name || 'Track'}.wav`}
+                  className="px-4 py-2 rounded-xl bg-cyan-500 text-slate-950 font-bold text-xs hover:bg-cyan-400 transition-all flex items-center gap-1.5 shadow-[0_0_15px_rgba(34,211,238,0.4)]"
                 >
-                  <Download className="w-3.5 h-3.5" /> Download (.wav)
+                  <Download className="w-4 h-4" /> Download WAV
                 </a>
               </div>
-              <audio controls src={finalCoverUrl} className="w-full h-9 rounded-lg" />
+
+              <audio controls src={finalCoverUrl} className="w-full h-10" />
             </div>
           )}
         </section>
 
       </main>
 
-      {/* Footer */}
-      <footer className="mt-8 border-t border-purple-900/30 py-4 px-4 text-center text-[11px] text-slate-500 font-mono-studio">
-        <p>AGE YT#5 Musik Cover — Remixer Studio Edition</p>
-      </footer>
-
-      {/* Compact Tabbed API Settings Modal */}
-      {showApiSettingsModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-[#0f0b2e] border border-purple-900/50 rounded-2xl max-w-lg w-full p-5 space-y-4 max-h-[85vh] overflow-y-auto">
-            <div className="flex items-center justify-between border-b border-purple-900/30 pb-3">
-              <h3 className="font-sora font-bold text-sm text-slate-100 flex items-center gap-2">
-                <Settings className="w-4 h-4 text-pink-400" /> Pengaturan API Key
+      {}
+      {/* API KEY SETTINGS MODAL */}
+      {showApiKeyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full p-5 shadow-2xl space-y-4">
+            
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <h3 className="font-display font-semibold text-base text-slate-100 flex items-center gap-2">
+                <Settings className="w-5 h-5 text-pink-400" /> Pengaturan API Key
               </h3>
-              <button onClick={() => setShowApiSettingsModal(false)} className="p-1 text-slate-400 hover:text-slate-200">
-                <X className="w-4 h-4" />
+              <button onClick={() => setShowApiKeyModal(false)} className="text-slate-400 hover:text-white p-1">
+                <X className="w-5 h-5" />
               </button>
             </div>
 
-            {/* Service Tabs Header */}
-            <div className="flex overflow-x-auto gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800 text-xs font-semibold scrollbar-none">
-              {['stemsplit', 'elevenlabs', 'kitsai', 'lalal', 'kieai'].map(srv => (
-                <button
-                  key={srv}
-                  onClick={() => setActiveApiKeyTab(srv)}
-                  className={`px-3 py-1.5 rounded-lg capitalize whitespace-nowrap transition-all ${
-                    activeApiKeyTab === srv ? 'bg-purple-600 text-slate-100 font-bold' : 'text-slate-400 hover:text-slate-200'
-                  }`}
+            {/* Service Tabs */}
+            <div className="flex gap-1 overflow-x-auto pb-1 text-xs border-b border-slate-800">
+              {[
+                { id: 'stemsplit', name: 'StemSplit.io' },
+                { id: 'elevenlabs', name: 'ElevenLabs' },
+                { id: 'kitsai', name: 'Kits.AI' },
+                { id: 'lalal', name: 'LALAL.AI' },
+                { id: 'kieai', name: 'Kie.ai' }
+              ].map(s => (
+                <button 
+                  key={s.id}
+                  onClick={() => setModalServiceTab(s.id)}
+                  className={`px-3 py-1.5 rounded-lg whitespace-nowrap font-medium transition-all ${modalServiceTab === s.id ? 'bg-pink-500/20 text-pink-300 border border-pink-500/40' : 'text-slate-400 hover:text-slate-200'}`}
                 >
-                  {srv}
+                  {s.name}
                 </button>
               ))}
             </div>
 
-            {/* Active Service Tab Body */}
-            <div className="space-y-3 pt-1">
-              <label className="block text-xs font-sora font-bold text-slate-300 capitalize">
-                API Key {activeApiKeyTab.toUpperCase()}
-              </label>
-              
-              <div className="flex gap-2">
+            {/* Tab Body */}
+            <div className="space-y-3 py-2">
+              <div className="flex items-center gap-2">
                 <input 
                   type="password"
-                  placeholder={`Masukkan API Key ${activeApiKeyTab}`}
-                  value={tempKeyInputs[activeApiKeyTab] || ''}
-                  onChange={e => setTempKeyInputs({ ...tempKeyInputs, [activeApiKeyTab]: e.target.value })}
-                  className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs font-mono-studio text-slate-200 focus:border-pink-500 outline-none"
+                  placeholder={`Masukkan ${modalServiceTab.toUpperCase()} API Key...`}
+                  value={tempKeyInputs[modalServiceTab] || ''}
+                  onChange={e => setTempKeyInputs(prev => ({ ...prev, [modalServiceTab]: e.target.value }))}
+                  className="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200 focus:border-pink-500 focus:outline-none font-mono"
                 />
-                <button onClick={() => handleSaveKey(activeApiKeyTab)} className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-xs font-bold rounded-xl text-slate-100 transition-all">
+                <button 
+                  onClick={() => handleSaveKey(modalServiceTab)}
+                  className="px-4 py-2 rounded-xl bg-pink-500 text-slate-950 font-semibold text-xs hover:bg-pink-400 transition-all"
+                >
                   💾 Simpan
                 </button>
               </div>
 
-              <div className="space-y-1.5">
-                {(apiKeys[activeApiKeyTab] || []).length === 0 ? (
-                  <p className="text-[11px] text-slate-500 italic p-2 bg-slate-950/50 rounded-lg text-center">Belum ada API key tersimpan.</p>
-                ) : (
-                  (apiKeys[activeApiKeyTab] || []).map((k, idx) => (
-                    <div key={idx} className="flex items-center justify-between p-2 rounded-lg bg-slate-950 border border-slate-800 text-xs">
-                      <span className="font-mono-studio text-slate-400 text-[11px]">{k.key.slice(0, 6)}...{k.key.slice(-4)}</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-mono-studio text-slate-400">{k.labelInfo}</span>
-                        <button onClick={() => handleDeleteKey(activeApiKeyTab, idx)} className="text-red-400 hover:text-red-300">
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
+              {/* Saved Key List */}
+              <div className="space-y-2 max-h-40 overflow-y-auto">
+                {(apiKeys[modalServiceTab] || []).map((k, idx) => (
+                  <div key={k.id} className="flex items-center justify-between p-2.5 rounded-xl bg-slate-950/60 border border-slate-800 text-xs font-mono">
+                    <div className="flex items-center gap-2">
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] ${idx === 0 && k.status !== 'failed' ? 'bg-emerald-950 text-emerald-400 border border-emerald-500/30' : k.status === 'failed' ? 'bg-red-950 text-red-400 border border-red-500/30' : 'bg-slate-800 text-slate-400'}`}>
+                        {idx === 0 && k.status !== 'failed' ? '🟢 AKTIF' : k.status === 'failed' ? '🔴 Gagal' : '⚪ Standby'}
+                      </span>
+                      <span className="text-slate-300">{k.key.slice(0, 6)}...{k.key.slice(-4)}</span>
+                      {k.remainingCredit && <span className="text-cyan-400">({k.remainingCredit})</span>}
                     </div>
-                  ))
-                )}
+
+                    <button onClick={() => handleDeleteKey(modalServiceTab, k.id)} className="text-slate-500 hover:text-red-400">
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
               </div>
             </div>
+
+            <p className="text-[11px] text-slate-500">
+              API key disimpan sementara di browser Anda dan tidak dikirim ke server luar selain penyedia API terkait.
+            </p>
+
           </div>
         </div>
       )}
 
-      {/* Help Modal */}
+      {/* HELP MODAL */}
       {showHelpModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-[#0f0b2e] border border-purple-900/50 rounded-2xl max-w-lg w-full p-5 space-y-3 max-h-[85vh] overflow-y-auto text-xs text-slate-300">
-            <div className="flex items-center justify-between border-b border-purple-900/30 pb-3">
-              <h3 className="font-sora font-bold text-sm text-slate-100 flex items-center gap-2">
-                <HelpCircle className="w-4 h-4 text-cyan-400" /> Bantuan Studio Remixer
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full p-5 shadow-2xl space-y-4 max-h-[85vh] overflow-y-auto">
+            
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <h3 className="font-display font-semibold text-base text-slate-100 flex items-center gap-2">
+                <HelpCircle className="w-5 h-5 text-cyan-400" /> Panduan & FAQ
               </h3>
-              <button onClick={() => setShowHelpModal(false)} className="p-1 text-slate-400 hover:text-slate-200">
-                <X className="w-4 h-4" />
+              <button onClick={() => setShowHelpModal(false)} className="text-slate-400 hover:text-white p-1">
+                <X className="w-5 h-5" />
               </button>
             </div>
-            <p>1. <strong>StemSplit.io</strong>: Pemisahan stem vokal & instrumen utama.</p>
-            <p>2. <strong>ElevenLabs</strong>: Speech-to-speech voice conversion AI.</p>
-            <p>3. <strong>Kie.ai</strong>: AI Music Generation Suno V4.</p>
-            <p>4. <strong>DSP Lokal</strong>: Mode cadangan otomatis jika API eksternal tidak dapat dijangkau.</p>
+
+            <div className="space-y-3 text-xs text-slate-300">
+              <h4 className="font-semibold text-cyan-300">Cara Mendapatkan API Key Gratis:</h4>
+              <ul className="list-disc pl-4 space-y-1 text-slate-400">
+                <li><strong>StemSplit.io:</strong> Daftar gratis untuk mendapat 5 menit kredit pemisahan vokal.</li>
+                <li><strong>ElevenLabs:</strong> 10.000 karakter gratis/bulan di elevenlabs.io.</li>
+                <li><strong>Kie.ai:</strong> Kredit gratis awal untuk generasi musik AI di kie.ai.</li>
+              </ul>
+
+              <h4 className="font-semibold text-cyan-300 pt-2">Alur Kerja 4 Langkah:</h4>
+              <p className="text-slate-400">1. Upload Lagu → 2. Pisahkan Trek → 3. Modifikasi Vokal & Gaya → 4. Mix Cover Final.</p>
+            </div>
+
           </div>
         </div>
       )}
+
+      {/* Footer Disclaimer */}
+      <footer className="max-w-6xl mx-auto px-4 py-8 border-t border-slate-900 text-center text-[11px] text-slate-600 space-y-1">
+        <p>AGE YT#5 Musik Cover — Studio Remixer AI & DSP Lokal</p>
+        <p>Biaya penggunaan API sepenuhnya ditanggung pengguna lewat API Key masing-masing. Gunakan hasil cover sesuai lisensi/hak cipta platform Anda.</p>
+      </footer>
 
     </div>
   );
