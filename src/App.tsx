@@ -153,8 +153,7 @@ async function fetchKeyCredit(service, apiKey) {
 }
 
 /**
- * Translates raw technical error messages (JSON/HTTP status codes/stack traces)
- * into friendly Indonesian messages for end users, while preserving console logs for devs.
+ * Translates raw technical error messages into friendly Indonesian messages.
  */
 function translateErrorToUserMessage(rawError, serviceName) {
   const serviceLabel = serviceName === 'stemsplit' ? 'StemSplit.io'
@@ -171,12 +170,10 @@ function translateErrorToUserMessage(rawError, serviceName) {
 
   const lowerMsg = rawMsg.toLowerCase();
 
-  // Keep rotation summary error as is if already clear
   if (rawMsg.includes('Semua API key')) {
     return rawMsg;
   }
 
-  // Credit exhaustion / Insufficient Funds
   if (
     lowerMsg.includes('insufficient_credits') ||
     lowerMsg.includes('402') ||
@@ -188,7 +185,6 @@ function translateErrorToUserMessage(rawError, serviceName) {
     return `Kredit API ${serviceLabel} kamu sudah habis. Tambahkan API key baru di menu ⚙️ Pengaturan API Key, atau tunggu jika layanan punya reset kredit berkala.`;
   }
 
-  // Invalid API key / Unauthorized
   if (
     lowerMsg.includes('401') ||
     lowerMsg.includes('403') ||
@@ -200,7 +196,6 @@ function translateErrorToUserMessage(rawError, serviceName) {
     return `API key ${serviceLabel} tidak valid atau sudah kadaluarsa. Periksa kembali key kamu di menu ⚙️ Pengaturan API Key.`;
   }
 
-  // Timeout / Request aborted
   if (
     lowerMsg.includes('timeout') ||
     lowerMsg.includes('aborterror') ||
@@ -209,7 +204,6 @@ function translateErrorToUserMessage(rawError, serviceName) {
     return `Proses memakan waktu terlalu lama dan dihentikan otomatis. Coba lagi, atau gunakan file audio yang lebih pendek.`;
   }
 
-  // Generic fallback with trimmed detail
   const shortDetail = rawMsg.length > 100 ? rawMsg.slice(0, 100) + '...' : rawMsg;
   return `Terjadi kendala teknis saat memproses permintaan ke ${serviceLabel}. Detail teknis: ${shortDetail}`;
 }
@@ -368,6 +362,9 @@ async function convertVoiceElevenLabs(vocalStemUrl, voiceId, apiKey, onProgress)
     blob = await response.blob();
   } else if (vocalStemUrl instanceof Blob) {
     blob = vocalStemUrl;
+  } else if (typeof vocalStemUrl === 'string' && vocalStemUrl.startsWith('blob:')) {
+    const response = await fetch(vocalStemUrl);
+    blob = await response.blob();
   } else {
     throw new Error('Format file vokal tidak valid');
   }
@@ -606,6 +603,94 @@ async function convertVoiceLocal(vocalStemSource, pitchPreset, onProgress) {
   return URL.createObjectURL(wavBlob);
 }
 
+async function mixAudioTracks(vocalUrl, instrumentalUrl, onProgress) {
+  onProgress(10, 'Mengambil data audio vokal & instrumen...');
+  
+  const fetchBuffer = async (url) => {
+    if (!url) throw new Error('URL audio tidak ditemukan');
+    let res;
+    if (typeof url === 'string' && url.startsWith('http')) {
+      const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(url)}`;
+      res = await fetch(proxiedUrl);
+    } else {
+      res = await fetch(url);
+    }
+    if (!res.ok) throw new Error(`Gagal mengunduh audio (HTTP ${res.status})`);
+    return await res.arrayBuffer();
+  };
+
+  const [vocalArrayBuf, instArrayBuf] = await Promise.all([
+    fetchBuffer(vocalUrl),
+    fetchBuffer(instrumentalUrl)
+  ]);
+
+  onProgress(35, 'Mendekode data audio (vokal & instrumen)...');
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  
+  const [vocalBuffer, instBuffer] = await Promise.all([
+    ctx.decodeAudioData(vocalArrayBuf),
+    ctx.decodeAudioData(instArrayBuf)
+  ]);
+
+  onProgress(60, 'Mencampur sampel audio vokal & instrumen...');
+  
+  const sampleRate = Math.max(vocalBuffer.sampleRate, instBuffer.sampleRate) || 44100;
+  const maxLength = Math.max(vocalBuffer.length, instBuffer.length);
+  const numChannels = 2; // stereo
+
+  const mixBuffer = ctx.createBuffer(numChannels, maxLength, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const outData = mixBuffer.getChannelData(channel);
+    
+    // Fallback to channel 0 if mono
+    const vChan = vocalBuffer.numberOfChannels > channel ? channel : 0;
+    const vData = vocalBuffer.getChannelData(vChan);
+    
+    const iChan = instBuffer.numberOfChannels > channel ? channel : 0;
+    const iData = instBuffer.getChannelData(iChan);
+
+    const vLen = vData.length;
+    const iLen = iData.length;
+
+    for (let i = 0; i < maxLength; i++) {
+      const vSample = i < vLen ? vData[i] : 0;
+      const iSample = i < iLen ? iData[i] : 0;
+      outData[i] = vSample + iSample;
+    }
+  }
+
+  onProgress(85, 'Normalisasi volume & konversi format WAV...');
+  
+  // Soft normalization check
+  let maxPeak = 0;
+  for (let channel = 0; channel < numChannels; channel++) {
+    const data = mixBuffer.getChannelData(channel);
+    for (let i = 0; i < maxLength; i++) {
+      const absVal = Math.abs(data[i]);
+      if (absVal > maxPeak) {
+        maxPeak = absVal;
+      }
+    }
+  }
+
+  if (maxPeak > 1.0) {
+    const scaleFactor = 0.98 / maxPeak; // Leave slight headroom
+    for (let channel = 0; channel < numChannels; channel++) {
+      const data = mixBuffer.getChannelData(channel);
+      for (let i = 0; i < maxLength; i++) {
+        data[i] *= scaleFactor;
+      }
+    }
+  }
+
+  onProgress(95, 'Mengompresi ke format WAV...');
+  const wavBlob = bufferToWavBlob(mixBuffer);
+  
+  onProgress(100, 'Final Cover Siap!');
+  return URL.createObjectURL(wavBlob);
+}
+
 function buildSunoStyleString(genre, mood, instruments, tempo) {
   const parts = [];
   if (genre) parts.push(genre);
@@ -665,8 +750,6 @@ function renderCreditBadge(service, credit) {
 
 /**
  * Executes an API function with automatic Key Rotation.
- * If a key fails (credit exhausted, 402, 401, error), it marks the key as failed in state
- * and automatically retries with the next non-failed key in line.
  */
 async function callWithKeyRotation(serviceName, apiKeysState, markKeyAsFailedFn, apiCallFn, onProgress, serviceLabel) {
   const availableKeys = (apiKeysState[serviceName] || []).filter(k => !k.failed);
@@ -1082,23 +1165,33 @@ export default function App() {
 
   const handleStartFinalMixing = async () => {
     setIsMixing(true);
-    setMixProgress(10);
-    setMixStatusText('Menyiapkan penggabungan audio...');
+    setMixProgress(5);
+    setMixStatusText('Menyiapkan penggabungan audio vokal & instrumen...');
 
     const vocalToUse = newVocalUrl || vocalStemUrl || originalAudioUrl;
     const instToUse = newInstrumentalUrl || instrumentalStemUrl || originalAudioUrl;
 
-    setTimeout(() => {
-      setMixProgress(50);
-      setMixStatusText('Pencampuran frekuensi vokal & instrumen...');
-      setTimeout(() => {
-        setMixProgress(100);
-        setMixStatusText('Final Cover Siap!');
-        setFinalCoverUrl(vocalToUse || instToUse);
-        setIsMixing(false);
-        addToast('Cover Musik Final Berhasil Digabungkan!', 'info');
-      }, 1000);
-    }, 1000);
+    if (!vocalToUse || !instToUse) {
+      addToast('Diperlukan trek vokal dan instrumen untuk digabungkan', 'warning');
+      setIsMixing(false);
+      return;
+    }
+
+    try {
+      const mixedUrl = await mixAudioTracks(vocalToUse, instToUse, (pct, msg) => {
+        setMixProgress(pct);
+        setMixStatusText(msg);
+      });
+
+      setFinalCoverUrl(mixedUrl);
+      setIsMixing(false);
+      addToast('Cover Musik Final Berhasil Digabungkan!', 'info');
+    } catch (err) {
+      console.error('[DEBUG-Mixing] Error mixing tracks:', err);
+      setIsMixing(false);
+      const friendlyMsg = translateErrorToUserMessage(err, 'local');
+      addToast(`Gagal menggabungkan audio: ${friendlyMsg}`, 'error');
+    }
   };
 
   return (
@@ -1526,7 +1619,7 @@ export default function App() {
             )}
           </button>
           <p className="text-[10px] text-slate-400 text-center mt-1.5">
-            Bagian yang belum diproses (vokal/instrumen) akan memakai versi asli lagu Anda secara otomatis.
+            Bagian yang belum diproses (vokal atau instrumen) akan memakai versi asli lagu Anda secara otomatis.
           </p>
 
           {finalCoverUrl && (
@@ -1565,6 +1658,7 @@ export default function App() {
       </footer>
 
       {/* Modal API Key Settings */}
+      {}
       {showApiModal && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className="bg-[#0f0b2e] border border-purple-800/60 rounded-2xl max-w-md w-full p-5 shadow-2xl relative">
