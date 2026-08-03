@@ -626,7 +626,10 @@ async function regenerateInstrumentalCoverApi(instrumentalBlobUrl, prompt, style
 
 async function pollKieAiStatus(taskId, apiKey, onProgress) {
   console.log(`[DEBUG-KieAI] Memulai polling task: ${taskId}`);
-  const maxAttempts = 40;
+  // Mode upload-cover (audio-to-audio) butuh waktu analisis audio referensi tambahan,
+  // sehingga bisa memakan waktu lebih lama dari mode generate biasa. Timeout diperpanjang
+  // dari 3.5 menit menjadi ~9 menit untuk mengakomodasi ini.
+  const maxAttempts = 108;
   const delayMs = 5000;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -658,6 +661,7 @@ async function pollKieAiStatus(taskId, apiKey, onProgress) {
 
       const taskData = resJson.data;
       const status = taskData?.status || taskData?.state;
+      console.log(`[DEBUG-KieAI] Status task saat ini: "${status}"`);
 
       if (status === 'SUCCESS' || status === 'COMPLETED' || status === 'SUCCESSFUL') {
         onProgress(98, 'Mengunduh hasil instrumental AI...');
@@ -697,7 +701,7 @@ async function pollKieAiStatus(taskId, apiKey, onProgress) {
     }
   }
 
-  throw new Error('Kie.ai polling timeout (melewati batas waktu 3.5 menit)');
+  throw new Error('Kie.ai polling timeout (melewati batas waktu 9 menit)');
 }
 
 async function convertVoiceLocal(vocalStemSource, pitchPreset, onProgress) {
