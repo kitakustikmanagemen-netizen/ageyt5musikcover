@@ -488,11 +488,27 @@ async function regenerateInstrumentalApi(prompt, styleString, negativeTags, voca
 async function uploadAudioToPublicUrl(blobUrl, filename, onProgress) {
   onProgress && onProgress('Menyiapkan file audio untuk diunggah...');
 
-  const sourceRes = await fetch(blobUrl);
-  if (!sourceRes.ok) {
-    throw new Error('Gagal membaca file audio sumber untuk diunggah ke penyimpanan publik');
+  let audioBlob;
+  if (typeof blobUrl === 'string' && blobUrl.startsWith('http')) {
+    // URL remote (mis. presigned URL dari storage StemSplit) tidak mengizinkan fetch()
+    // lintas origin langsung dari browser (CORS) — harus lewat proxy relay-fetch.
+    const proxiedUrl = `https://stemsplit-proxy.kitakustik-managemen.workers.dev/relay-fetch?target=${encodeURIComponent(blobUrl)}`;
+    const sourceRes = await fetch(proxiedUrl);
+    if (!sourceRes.ok) {
+      throw new Error(`Gagal membaca file audio sumber via proxy (HTTP ${sourceRes.status})`);
+    }
+    audioBlob = await sourceRes.blob();
+  } else if (blobUrl instanceof Blob) {
+    audioBlob = blobUrl;
+  } else if (typeof blobUrl === 'string' && blobUrl.startsWith('blob:')) {
+    const sourceRes = await fetch(blobUrl);
+    if (!sourceRes.ok) {
+      throw new Error('Gagal membaca file audio sumber untuk diunggah ke penyimpanan publik');
+    }
+    audioBlob = await sourceRes.blob();
+  } else {
+    throw new Error('Format file audio sumber tidak valid');
   }
-  const audioBlob = await sourceRes.blob();
 
   onProgress && onProgress('Mengunggah instrumental ke penyimpanan publik...');
 
@@ -876,6 +892,25 @@ function renderCreditBadge(service, credit) {
 }
 
 /**
+ * Menentukan apakah sebuah error memang menandakan key benar-benar habis kredit
+ * atau tidak valid (layak ditandai "Gagal" secara permanen), berbeda dari error
+ * jaringan/CORS/timeout sesaat yang tidak seharusnya mendiskualifikasi key yang masih bagus.
+ */
+function isKeyExhaustionError(err) {
+  const msg = (err?.message || String(err || '')).toLowerCase();
+  return (
+    msg.includes('credit') ||
+    msg.includes('insufficient') ||
+    msg.includes('402') ||
+    msg.includes('401') ||
+    msg.includes('403') ||
+    msg.includes('unauthorized') ||
+    msg.includes('invalid api key') ||
+    msg.includes('invalid_api_key')
+  );
+}
+
+/**
  * Executes an API function with automatic Key Rotation.
  */
 async function callWithKeyRotation(serviceName, apiKeysState, markKeyAsFailedFn, apiCallFn, onProgress, serviceLabel) {
@@ -901,8 +936,11 @@ async function callWithKeyRotation(serviceName, apiKeysState, markKeyAsFailedFn,
       console.warn(`[DEBUG-KeyRotation] ${serviceName} Key #${keyNum} gagal (raw):`, err.message);
       lastError = err;
 
-      // Mark this key as failed in state so badge turns 🔴 Gagal immediately
-      markKeyAsFailedFn(serviceName, key);
+      // Hanya tandai key sebagai "Gagal" permanen kalau errornya memang soal kredit/otorisasi.
+      // Error jaringan/CORS/timeout sesaat tidak mendiskualifikasi key yang masih valid.
+      if (isKeyExhaustionError(err)) {
+        markKeyAsFailedFn(serviceName, key);
+      }
 
       if (i < totalKeys - 1) {
         onProgress(
@@ -914,7 +952,7 @@ async function callWithKeyRotation(serviceName, apiKeysState, markKeyAsFailedFn,
     }
   }
 
-  throw new Error(`Semua API key untuk ${serviceLabel || serviceName} sudah habis kredit atau tidak aktif. Tambahkan key baru di menu ⚙️ Pengaturan API Key.`);
+  throw lastError || new Error(`Semua API key untuk ${serviceLabel || serviceName} sudah habis kredit atau tidak aktif. Tambahkan key baru di menu ⚙️ Pengaturan API Key.`);
 }
 
 export default function App() {
