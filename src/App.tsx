@@ -481,6 +481,133 @@ async function regenerateInstrumentalApi(prompt, styleString, negativeTags, voca
   }
 }
 
+/**
+ * Upload file audio (dari blob URL lokal) ke R2 bucket lewat worker stemsplit-proxy,
+ * mengembalikan URL publik permanen yang bisa diakses server pihak ketiga (mis. Kie.ai).
+ */
+async function uploadAudioToPublicUrl(blobUrl, filename, onProgress) {
+  onProgress && onProgress('Menyiapkan file audio untuk diunggah...');
+
+  const sourceRes = await fetch(blobUrl);
+  if (!sourceRes.ok) {
+    throw new Error('Gagal membaca file audio sumber untuk diunggah ke penyimpanan publik');
+  }
+  const audioBlob = await sourceRes.blob();
+
+  onProgress && onProgress('Mengunggah instrumental ke penyimpanan publik...');
+
+  const safeFilename = (filename || 'instrumental.wav').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const uploadRes = await fetch(
+      `https://stemsplit-proxy.kitakustik-managemen.workers.dev/r2-upload?filename=${encodeURIComponent(safeFilename)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': audioBlob.type || 'audio/wav' },
+        body: audioBlob,
+        signal: controller.signal
+      }
+    );
+    clearTimeout(timeoutId);
+
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      throw new Error(`Gagal mengunggah audio ke R2 (HTTP ${uploadRes.status}): ${errText.slice(0, 150)}`);
+    }
+
+    const uploadJson = await uploadRes.json();
+    if (!uploadJson.url) {
+      throw new Error('Server tidak mengembalikan URL publik setelah upload');
+    }
+
+    return uploadJson.url;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      throw new Error('Upload audio ke penyimpanan publik timeout (60 detik)');
+    }
+    throw err;
+  }
+}
+
+/**
+ * Kie.ai AI Music Cover API (Model V4) — mode audio-to-audio.
+ * Menerima instrumental ASLI sebagai referensi (uploadUrl) sehingga hasil regenerasi
+ * gaya musik baru TETAP mempertahankan melodi, tempo, dan durasi lagu asli
+ * (berbeda dari mode text-to-music biasa yang menghasilkan komposisi independen).
+ */
+async function regenerateInstrumentalCoverApi(instrumentalBlobUrl, prompt, styleString, negativeTags, vocalGender, apiKey, onProgress) {
+  console.log('[DEBUG-KieAI] Mengunggah instrumental asli sebagai referensi cover...');
+  onProgress(5, 'Mengunggah instrumental asli sebagai referensi...');
+
+  const publicUploadUrl = await uploadAudioToPublicUrl(instrumentalBlobUrl, 'instrumental_source.wav', (msg) => {
+    onProgress(10, msg);
+  });
+
+  console.log('[DEBUG-KieAI] Instrumental berhasil diunggah:', publicUploadUrl);
+  onProgress(15, 'Menghubungi Kie.ai API (Upload & Cover)...');
+
+  const promptText = prompt && prompt.trim() !== '' ? prompt : 'Custom instrumental cover track';
+
+  const payload = {
+    uploadUrl: publicUploadUrl,
+    customMode: true,
+    model: 'V4',
+    prompt: promptText,
+    style: styleString || 'Acoustic, Calm',
+    negativeTags: Array.isArray(negativeTags) ? negativeTags.join(', ') : (negativeTags || ''),
+    title: 'Custom Style Cover',
+    instrumental: true,
+    callBackUrl: 'https://ageyt5musikcover.kitakustik-managemen.workers.dev/kie-callback-placeholder'
+  };
+
+  if (vocalGender && vocalGender !== 'none') {
+    payload.vocalGender = vocalGender;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const res = await fetch('https://api.kie.ai/api/v1/generate/upload-cover', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Kie.ai Upload-Cover API Error (HTTP ${res.status}): ${errText.slice(0, 200)}`);
+    }
+
+    const resJson = await res.json();
+    console.log('[DEBUG-KieAI] Upload-Cover Response:', resJson);
+
+    if (resJson.code !== 200) {
+      throw new Error(`Kie.ai Error: ${resJson.msg || 'Gagal membuat task cover'}`);
+    }
+
+    const taskId = resJson.data?.taskId || resJson.data;
+    if (!taskId) {
+      throw new Error('Task ID tidak ditemukan dari Kie.ai');
+    }
+
+    return await pollKieAiStatus(taskId, apiKey, onProgress);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Kie.ai request timeout (30 detik)');
+    }
+    throw err;
+  }
+}
+
 async function pollKieAiStatus(taskId, apiKey, onProgress) {
   console.log(`[DEBUG-KieAI] Memulai polling task: ${taskId}`);
   const maxAttempts = 40;
@@ -1124,9 +1251,13 @@ export default function App() {
       return;
     }
 
-    // AI Mode (Kie.ai) with auto key rotation
+    // AI Mode (Kie.ai) with auto key rotation — audio-to-audio cover (sinkron dengan lagu asli)
     const hasKieKeys = (apiKeys.kie || []).some(k => !k.failed);
-    if (hasKieKeys) {
+    const sourceInstrumentalForCover = instrumentalStemUrl;
+
+    if (hasKieKeys && !sourceInstrumentalForCover) {
+      addToast('Pisahkan trek lagu dulu (Langkah 2) sebelum memakai Ubah Gaya Musik AI. Memakai Mode Gratis sebagai gantinya.', 'warning');
+    } else if (hasKieKeys) {
       try {
         const styleString = buildSunoStyleString(genre, mood, selectedInstruments, tempoPref);
         const resUrl = await callWithKeyRotation(
@@ -1134,7 +1265,7 @@ export default function App() {
           apiKeys,
           markKeyAsFailed,
           async (activeKey) => {
-            return await regenerateInstrumentalApi(customPrompt, styleString, negativeTags, vocalGenderPref, activeKey, (pct, msg) => {
+            return await regenerateInstrumentalCoverApi(sourceInstrumentalForCover, customPrompt, styleString, negativeTags, vocalGenderPref, activeKey, (pct, msg) => {
               setStyleProgress(pct);
               setStyleStatusText(msg);
             });
@@ -1148,7 +1279,7 @@ export default function App() {
 
         setNewInstrumentalUrl(resUrl);
         setIsRegeneratingStyle(false);
-        addToast('Regenerasi Musik Kie.ai (V4) Berhasil!', 'info');
+        addToast('Regenerasi Musik Kie.ai (V4) Berhasil! (sinkron dengan lagu asli)', 'info');
         return;
       } catch (err) {
         console.warn('[DEBUG-KieAI] Final error (raw):', err.message);
