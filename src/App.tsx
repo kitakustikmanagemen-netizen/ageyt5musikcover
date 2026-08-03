@@ -510,9 +510,34 @@ async function uploadAudioToPublicUrl(blobUrl, filename, onProgress) {
     throw new Error('Format file audio sumber tidak valid');
   }
 
+  if (!audioBlob || audioBlob.size === 0) {
+    throw new Error('File audio sumber kosong (0 byte), tidak bisa diunggah');
+  }
+
+  // PENTING: deteksi ekstensi file dari MIME type ASLI blob, jangan pakai ekstensi
+  // hardcode dari pemanggil — mismatch ekstensi vs isi file (mis. isinya MP3 tapi
+  // diberi nama .wav) bisa membuat server pihak ketiga gagal membaca/parsing audio.
+  const mimeToExt = {
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/wav': 'wav',
+    'audio/wave': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/webm': 'webm',
+    'audio/ogg': 'ogg',
+    'audio/mp4': 'm4a',
+    'audio/x-m4a': 'm4a',
+    'audio/flac': 'flac'
+  };
+  const detectedExt = mimeToExt[audioBlob.type] || (filename || '').split('.').pop() || 'mp3';
+  const baseName = (filename || 'instrumental').replace(/\.[a-zA-Z0-9]+$/, '');
+  const finalFilename = `${baseName}.${detectedExt}`;
+
+  console.log(`[DEBUG-Upload] Blob type asli: "${audioBlob.type}", size: ${audioBlob.size} bytes, nama file final: ${finalFilename}`);
+
   onProgress && onProgress('Mengunggah instrumental ke penyimpanan publik...');
 
-  const safeFilename = (filename || 'instrumental.wav').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const safeFilename = finalFilename.replace(/[^a-zA-Z0-9._-]/g, '_');
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 60000);
 
@@ -521,7 +546,7 @@ async function uploadAudioToPublicUrl(blobUrl, filename, onProgress) {
       `https://stemsplit-proxy.kitakustik-managemen.workers.dev/r2-upload?filename=${encodeURIComponent(safeFilename)}`,
       {
         method: 'PUT',
-        headers: { 'Content-Type': audioBlob.type || 'audio/wav' },
+        headers: { 'Content-Type': audioBlob.type || 'application/octet-stream' },
         body: audioBlob,
         signal: controller.signal
       }
@@ -538,6 +563,7 @@ async function uploadAudioToPublicUrl(blobUrl, filename, onProgress) {
       throw new Error('Server tidak mengembalikan URL publik setelah upload');
     }
 
+    console.log('[DEBUG-Upload] URL publik hasil upload:', uploadJson.url);
     return uploadJson.url;
   } catch (err) {
     clearTimeout(timeoutId);
@@ -558,7 +584,7 @@ async function regenerateInstrumentalCoverApi(instrumentalBlobUrl, prompt, style
   console.log('[DEBUG-KieAI] Mengunggah instrumental asli sebagai referensi cover...');
   onProgress(5, 'Mengunggah instrumental asli sebagai referensi...');
 
-  const publicUploadUrl = await uploadAudioToPublicUrl(instrumentalBlobUrl, 'instrumental_source.wav', (msg) => {
+  const publicUploadUrl = await uploadAudioToPublicUrl(instrumentalBlobUrl, 'instrumental_source', (msg) => {
     onProgress(10, msg);
   });
 
@@ -576,6 +602,9 @@ async function regenerateInstrumentalCoverApi(instrumentalBlobUrl, prompt, style
     negativeTags: Array.isArray(negativeTags) ? negativeTags.join(', ') : (negativeTags || ''),
     title: 'Custom Style Cover',
     instrumental: true,
+    styleWeight: 0.65,
+    weirdnessConstraint: 0.65,
+    audioWeight: 0.65,
     callBackUrl: 'https://ageyt5musikcover.kitakustik-managemen.workers.dev/kie-callback-placeholder'
   };
 
@@ -690,8 +719,12 @@ async function pollKieAiStatus(taskId, apiKey, onProgress) {
         return URL.createObjectURL(audioBlob);
       }
 
-      if (status === 'FAILED' || status === 'ERROR') {
-        throw new Error(`Generasi Kie.ai gagal: ${taskData.errorMessage || taskData.failReason || 'Gagal diproses'}`);
+      const knownFailedStatuses = [
+        'FAILED', 'ERROR', 'GENERATE_AUDIO_FAILED', 'CREATE_TASK_FAILED',
+        'CALLBACK_EXCEPTION', 'SENSITIVE_WORD_ERROR'
+      ];
+      if (typeof status === 'string' && knownFailedStatuses.includes(status.toUpperCase())) {
+        throw new Error(`Generasi Kie.ai gagal (${status}): ${taskData.errorMessage || taskData.failReason || taskData.msg || 'Tidak ada detail alasan dari Kie.ai'}`);
       }
     } catch (err) {
       if (err.message.includes('Gagal mengunduh audio') || err.message.includes('Generasi Kie.ai gagal')) {
