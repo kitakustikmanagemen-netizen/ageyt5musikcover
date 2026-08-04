@@ -861,10 +861,36 @@ async function mixAudioTracks(vocalUrl, instrumentalUrl, onProgress) {
   ]);
 
   onProgress(60, 'Mencampur sampel audio vokal & instrumen...');
-  
+
   const sampleRate = Math.max(vocalBuffer.sampleRate, instBuffer.sampleRate) || 44100;
   const maxLength = Math.max(vocalBuffer.length, instBuffer.length);
   const numChannels = 2; // stereo
+
+  // Hitung RMS (loudness rata-rata) tiap trek untuk deteksi ketimpangan volume.
+  // Tanpa ini, trek yang jauh lebih pelan (mis. instrumental AI dari Kie.ai) bisa
+  // "tenggelam" saat dijumlahkan langsung dengan trek yang lebih keras (vokal).
+  const computeRMS = (buffer) => {
+    let sumSquares = 0;
+    let totalSamples = 0;
+    for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+      const data = buffer.getChannelData(ch);
+      for (let i = 0; i < data.length; i++) {
+        sumSquares += data[i] * data[i];
+      }
+      totalSamples += data.length;
+    }
+    return totalSamples > 0 ? Math.sqrt(sumSquares / totalSamples) : 0;
+  };
+
+  const vocalRMS = computeRMS(vocalBuffer);
+  const instRMS = computeRMS(instBuffer);
+  console.log(`[DEBUG-Mixing] RMS vokal: ${vocalRMS.toFixed(5)}, RMS instrumental: ${instRMS.toFixed(5)}`);
+
+  const targetRMS = Math.max(vocalRMS, instRMS, 0.0001);
+  const maxGain = 4; // batas atas biar tidak over-amplify noise/silence pada trek yang nyaris hening
+  const vocalGain = Math.min(targetRMS / Math.max(vocalRMS, 0.0001), maxGain);
+  const instGain = Math.min(targetRMS / Math.max(instRMS, 0.0001), maxGain);
+  console.log(`[DEBUG-Mixing] Gain diterapkan — vokal: x${vocalGain.toFixed(2)}, instrumental: x${instGain.toFixed(2)}`);
 
   const mixBuffer = ctx.createBuffer(numChannels, maxLength, sampleRate);
 
@@ -882,8 +908,10 @@ async function mixAudioTracks(vocalUrl, instrumentalUrl, onProgress) {
     const iLen = iData.length;
 
     for (let i = 0; i < maxLength; i++) {
-      const vSample = i < vLen ? vData[i] : 0;
-      const iSample = i < iLen ? iData[i] : 0;
+      const vSample = i < vLen ? vData[i] * vocalGain : 0;
+      // Kalau instrumental lebih pendek dari vokal, ULANG (loop) dari awal untuk
+      // mengisi sisa durasi, daripada dibiarkan diam total di bagian akhir.
+      const iSample = iLen > 0 ? iData[i % iLen] * instGain : 0;
       outData[i] = vSample + iSample;
     }
   }
