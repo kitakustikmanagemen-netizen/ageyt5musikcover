@@ -431,7 +431,7 @@ async function regenerateInstrumentalApi(prompt, styleString, negativeTags, voca
   console.log('[DEBUG-KieAI] Menghubungi Kie.ai API...');
   onProgress(15, 'Menghubungi Kie.ai API (Model V4)...');
 
-  const promptText = prompt && prompt.trim() !== '' ? prompt : 'Custom instrumental cover track';
+  const promptText = prompt && prompt.trim() !== '' ? prompt : `A high quality instrumental cover arrangement in the style of ${styleString || 'acoustic, calm'}. Rich, polished studio production with clear rhythm, full instrumentation, and smooth dynamics that complement a vocal performance from start to finish.`;
 
   const payload = {
     customMode: true,
@@ -599,7 +599,11 @@ async function regenerateInstrumentalCoverApi(instrumentalBlobUrl, prompt, style
   console.log('[DEBUG-KieAI] Instrumental berhasil diunggah:', publicUploadUrl);
   onProgress(15, 'Menghubungi Kie.ai API (Upload & Cover)...');
 
-  const promptText = prompt && prompt.trim() !== '' ? prompt : 'Custom instrumental cover track';
+  // Prompt fallback dibuat lebih panjang & deskriptif (bukan cuma 4 kata) karena
+  // Kie.ai pernah menolak dengan alasan "lyrics are empty, too short, or malformed"
+  // saat prompt terlalu pendek/generik.
+  const defaultPromptFallback = `A high quality instrumental cover arrangement in the style of ${styleString || 'acoustic, calm'}. Rich, polished studio production with clear rhythm, full instrumentation, and smooth dynamics that complement a vocal performance from start to finish.`;
+  const promptText = prompt && prompt.trim() !== '' ? prompt : defaultPromptFallback;
 
   const payload = {
     uploadUrl: publicUploadUrl,
@@ -610,13 +614,11 @@ async function regenerateInstrumentalCoverApi(instrumentalBlobUrl, prompt, style
     negativeTags: Array.isArray(negativeTags) ? negativeTags.join(', ') : (negativeTags || ''),
     title: 'Custom Style Cover',
     instrumental: true,
-    // audioWeight dinaikkan (dari 0.65) agar AI lebih patuh mengikuti tempo, nada, dan
-    // struktur musik dari audio referensi asli. weirdnessConstraint diturunkan (dari 0.65)
-    // agar AI tidak terlalu bebas berimprovisasi/menyimpang dari komposisi asli.
-    // CATATAN: sempat dicoba audioWeight lebih tinggi (0.85) + weirdnessConstraint
-    // lebih rendah (0.25) untuk hasil lebih patuh ke referensi, TAPI ini terbukti
-    // menyebabkan GENERATE_AUDIO_FAILED pada lagu yang sebelumnya berhasil dengan
-    // nilai default. Dikembalikan ke 0.65/0.65/0.65 yang sudah terverifikasi berhasil.
+    // Nilai default Kie.ai yang sudah terverifikasi berhasil. Pernah dicoba dinaikkan
+    // (audioWeight 0.85, weirdnessConstraint 0.25) tapi itu TIDAK memperbaiki masalah
+    // dan sempat diduga jadi penyebab GENERATE_AUDIO_FAILED — namun setelah di-revert
+    // ke default pun error serupa masih muncul, jadi parameter ini BUKAN akar masalah.
+    // Root cause sebenarnya kemungkinan besar prompt yang terlalu pendek (lihat di atas).
     styleWeight: 0.65,
     weirdnessConstraint: 0.65,
     audioWeight: 0.65,
