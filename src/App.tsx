@@ -668,6 +668,8 @@ async function pollKieAiStatus(taskId, apiKey, onProgress) {
   // dari 3.5 menit menjadi ~9 menit untuk mengakomodasi ini.
   const maxAttempts = 108;
   const delayMs = 5000;
+  let shortDurationRetries = 0;
+  const maxShortDurationRetries = 6; // tambahan ~30 detik toleransi kalau file masih difinalisasi
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const progressPct = Math.min(20 + Math.floor((attempt / maxAttempts) * 75), 95);
@@ -704,12 +706,49 @@ async function pollKieAiStatus(taskId, apiKey, onProgress) {
         onProgress(98, 'Mengunduh hasil instrumental AI...');
         
         let audioUrl = null;
-        if (Array.isArray(taskData.response?.sunoData)) {
-          audioUrl = taskData.response.sunoData[0]?.audioUrl || taskData.response.sunoData[0]?.streamAudioUrl;
+        let pickedDuration = null;
+
+        const candidateList = Array.isArray(taskData.response?.sunoData)
+          ? taskData.response.sunoData
+          : (Array.isArray(taskData.sunoData) ? taskData.sunoData : null);
+
+        if (candidateList && candidateList.length > 0) {
+          console.log('[DEBUG-KieAI] Daftar kandidat track hasil:', candidateList.map(t => ({
+            duration: t.duration, audioUrl: t.audioUrl ? 'ada' : 'tidak ada', streamAudioUrl: t.streamAudioUrl ? 'ada' : 'tidak ada'
+          })));
+
+          // Pilih kandidat dengan durasi TERPANJANG (bukan asal index 0), karena Kie.ai/Suno
+          // kadang mengembalikan lebih dari satu varian dan varian pertama belum tentu yang
+          // paling lengkap/final durasinya.
+          const bestCandidate = candidateList.reduce((best, current) => {
+            const currentDur = typeof current.duration === 'number' ? current.duration : 0;
+            const bestDur = best && typeof best.duration === 'number' ? best.duration : 0;
+            return currentDur > bestDur ? current : (best || current);
+          }, null);
+
+          audioUrl = bestCandidate?.audioUrl || bestCandidate?.streamAudioUrl;
+          pickedDuration = bestCandidate?.duration;
         } else if (taskData.audioUrl) {
           audioUrl = taskData.audioUrl;
-        } else if (taskData.sunoData && taskData.sunoData[0]) {
-          audioUrl = taskData.sunoData[0].audioUrl;
+          pickedDuration = taskData.duration;
+        }
+
+        console.log(`[DEBUG-KieAI] Track terpilih — durasi menurut metadata Kie.ai: ${pickedDuration ?? 'tidak diketahui'} detik`);
+
+        // Antisipasi race condition: status sudah SUCCESS tapi file audio penuh masih
+        // difinalisasi di CDN Kie.ai (durasi metadata masih sangat pendek, mis. <20 detik).
+        // Tunggu sebentar dan cek ulang sebelum menganggap ini hasil final.
+        if (
+          typeof pickedDuration === 'number' &&
+          pickedDuration > 0 &&
+          pickedDuration < 20 &&
+          shortDurationRetries < maxShortDurationRetries
+        ) {
+          shortDurationRetries++;
+          console.warn(`[DEBUG-KieAI] Durasi hasil masih sangat pendek (${pickedDuration}s), kemungkinan file belum final. Menunggu dan cek ulang (${shortDurationRetries}/${maxShortDurationRetries})...`);
+          onProgress(96, `Durasi hasil masih pendek, menunggu finalisasi file (${shortDurationRetries}/${maxShortDurationRetries})...`);
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
         }
 
         if (!audioUrl) {
@@ -723,6 +762,7 @@ async function pollKieAiStatus(taskId, apiKey, onProgress) {
         }
 
         const audioBlob = await audioRes.blob();
+        console.log(`[DEBUG-KieAI] Audio hasil diunduh — ukuran blob: ${audioBlob.size} bytes, type: ${audioBlob.type}`);
         onProgress(100, 'Instrumental AI siap!');
         return URL.createObjectURL(audioBlob);
       }
