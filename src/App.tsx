@@ -197,6 +197,14 @@ function translateErrorToUserMessage(rawError, serviceName) {
   }
 
   if (
+    lowerMsg.includes('matches an existing recording') ||
+    lowerMsg.includes('existing recording in our catalog') ||
+    lowerMsg.includes('catalog')
+  ) {
+    return `Lagu ini terdeteksi cocok dengan rekaman komersial yang sudah terdaftar di database ${serviceLabel} (perlindungan hak cipta). Mode audio-referensi tidak bisa dipakai untuk lagu ini — otomatis dialihkan ke mode generate biasa (hasil mungkin tidak sinkron sempurna dengan lagu asli).`;
+  }
+
+  if (
     lowerMsg.includes('timeout') ||
     lowerMsg.includes('aborterror') ||
     lowerMsg.includes('dihentikan')
@@ -433,7 +441,7 @@ async function regenerateInstrumentalApi(prompt, styleString, negativeTags, voca
     negativeTags: Array.isArray(negativeTags) ? negativeTags.join(', ') : (negativeTags || ''),
     title: 'Custom Style Cover',
     instrumental: true,
-    callBackUrl: 'https://ageyt5musikcover.kitakustik-managemen.workers.dev/kie-callback-placeholder'
+    callBackUrl: 'https://cover.andriage.my.id/kie-callback-placeholder'
   };
 
   if (vocalGender && vocalGender !== 'none') {
@@ -605,7 +613,7 @@ async function regenerateInstrumentalCoverApi(instrumentalBlobUrl, prompt, style
     styleWeight: 0.65,
     weirdnessConstraint: 0.65,
     audioWeight: 0.65,
-    callBackUrl: 'https://ageyt5musikcover.kitakustik-managemen.workers.dev/kie-callback-placeholder'
+    callBackUrl: 'https://cover.andriage.my.id/kie-callback-placeholder'
   };
 
   if (vocalGender && vocalGender !== 'none') {
@@ -1358,8 +1366,47 @@ export default function App() {
         return;
       } catch (err) {
         console.warn('[DEBUG-KieAI] Final error (raw):', err.message);
-        const friendlyMsg = translateErrorToUserMessage(err, 'kie');
-        addToast(`${friendlyMsg} Memakai Mode Gratis sebagai gantinya.`, 'warning', handleStartStyleRegeneration);
+        const isCatalogCopyrightError = err.message.toLowerCase().includes('catalog') ||
+          err.message.toLowerCase().includes('existing recording');
+
+        if (isCatalogCopyrightError) {
+          // Lagu ini terdeteksi hak cipta oleh Kie.ai — mode audio-referensi tidak bisa dipakai.
+          // Fallback ke mode generate biasa (text-to-music, tanpa audio referensi) yang tidak
+          // melewati pengecekan katalog ini. Catatan: hasil generate mode ini TIDAK sinkron
+          // sempurna dengan durasi/melodi lagu asli (komposisi independen berdasarkan prompt).
+          addToast('Lagu ini terdeteksi hak cipta oleh Kie.ai. Mencoba mode generate biasa sebagai gantinya (durasi mungkin tidak sinkron)...', 'warning');
+          try {
+            const styleStringFallback = buildSunoStyleString(genre, mood, selectedInstruments, tempoPref);
+            const fallbackResUrl = await callWithKeyRotation(
+              'kie',
+              apiKeys,
+              markKeyAsFailed,
+              async (activeKey) => {
+                return await regenerateInstrumentalApi(customPrompt, styleStringFallback, negativeTags, vocalGenderPref, activeKey, (pct, msg) => {
+                  setStyleProgress(pct);
+                  setStyleStatusText(msg);
+                });
+              },
+              (pct, msg) => {
+                setStyleProgress(pct);
+                setStyleStatusText(msg);
+              },
+              'Kie.ai'
+            );
+
+            setNewInstrumentalUrl(fallbackResUrl);
+            setIsRegeneratingStyle(false);
+            addToast('Regenerasi Musik Kie.ai berhasil (mode generate biasa, tanpa referensi audio — durasi mungkin berbeda dari lagu asli)', 'info');
+            return;
+          } catch (fallbackErr) {
+            console.warn('[DEBUG-KieAI] Fallback generate biasa juga gagal (raw):', fallbackErr.message);
+            const fallbackFriendlyMsg = translateErrorToUserMessage(fallbackErr, 'kie');
+            addToast(`${fallbackFriendlyMsg} Memakai Mode Gratis sebagai gantinya.`, 'warning', handleStartStyleRegeneration);
+          }
+        } else {
+          const friendlyMsg = translateErrorToUserMessage(err, 'kie');
+          addToast(`${friendlyMsg} Memakai Mode Gratis sebagai gantinya.`, 'warning', handleStartStyleRegeneration);
+        }
       }
     } else {
       addToast('Tidak ada API Key Kie.ai aktif. Memakai Mode Gratis sebagai gantinya.', 'warning');
