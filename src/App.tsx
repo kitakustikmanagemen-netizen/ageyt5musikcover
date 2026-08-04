@@ -613,9 +613,13 @@ async function regenerateInstrumentalCoverApi(instrumentalBlobUrl, prompt, style
     // audioWeight dinaikkan (dari 0.65) agar AI lebih patuh mengikuti tempo, nada, dan
     // struktur musik dari audio referensi asli. weirdnessConstraint diturunkan (dari 0.65)
     // agar AI tidak terlalu bebas berimprovisasi/menyimpang dari komposisi asli.
-    styleWeight: 0.6,
-    weirdnessConstraint: 0.25,
-    audioWeight: 0.85,
+    // CATATAN: sempat dicoba audioWeight lebih tinggi (0.85) + weirdnessConstraint
+    // lebih rendah (0.25) untuk hasil lebih patuh ke referensi, TAPI ini terbukti
+    // menyebabkan GENERATE_AUDIO_FAILED pada lagu yang sebelumnya berhasil dengan
+    // nilai default. Dikembalikan ke 0.65/0.65/0.65 yang sudah terverifikasi berhasil.
+    styleWeight: 0.65,
+    weirdnessConstraint: 0.65,
+    audioWeight: 0.65,
     callBackUrl: 'https://cover.andriage.my.id/kie-callback-placeholder'
   };
 
